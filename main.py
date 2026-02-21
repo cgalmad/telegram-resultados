@@ -17,7 +17,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # =========================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+    format="%(asctime)s %(levelname)s:%(name)s:%(name)s:%(message)s",
 )
 log = logging.getLogger("telegram-resultados")
 
@@ -27,7 +27,6 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60").strip())
 STATE_FILE = os.getenv("STATE_FILE", "state.json").strip()
 
 # Primary: TheSportsDB
-# IMPORTANTE: si SPORTSDB_KEY está vacío, NO construimos una URL con doble "//"
 SPORTSDB_KEY = os.getenv("SPORTSDB_KEY", "1").strip()  # "1" suele ser la shared key
 SPORTSDB_ENABLED = bool(SPORTSDB_KEY)
 SPORTSDB_BASE = f"https://www.thesportsdb.com/api/v1/json/{SPORTSDB_KEY}" if SPORTSDB_ENABLED else ""
@@ -209,7 +208,6 @@ async def http_get_json(url: str, params: Optional[dict] = None, headers: Option
         return r.json()
 
 def is_sportsdb_unusable_error(exc: Exception) -> bool:
-    # Si la key es mala / endpoint devuelve HTML / 404, etc.
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
         return code in {401, 403, 404, 429, 500, 502, 503}
@@ -321,7 +319,6 @@ async def find_best_event_sportsdb(home: str, away: str, target_date: Optional[d
             candidates.extend(await fetch_events_for_day(d))
         except Exception as e:
             if is_sportsdb_unusable_error(e):
-                # No marcamos como fatal aquí; solo significa que el feed diario no sirve.
                 log.info("SportsDB eventsday no usable (%s): %s", d, repr(e))
             else:
                 log.exception("Error pidiendo eventsday %s", d)
@@ -333,7 +330,6 @@ async def find_best_event_sportsdb(home: str, away: str, target_date: Optional[d
         if best_score >= 45:
             return best_ev
 
-    # fallback por equipo (SportsDB)
     try:
         home_team = await search_team_id_sportsdb(home)
         away_norm = normalize_team(away)
@@ -372,11 +368,6 @@ async def fetch_event_by_id_sportsdb(event_id: str) -> Optional[dict]:
     return events[0] if events else None
 
 async def verify_event_usable_sportsdb(event_id: str) -> bool:
-    """
-    Verificación crítica:
-    aunque encontremos un partido en SportsDB (por search/feeds),
-    si lookupevent.php no devuelve evento, para nosotros está "bloqueado" => usamos API-SPORTS.
-    """
     if not SPORTSDB_ENABLED:
         return False
     if not event_id:
@@ -570,10 +561,6 @@ def fmt_pick(pick: str) -> str:
 # MIGRATION: SportsDB -> API-SPORTS
 # =========================
 async def migrate_match_to_apisports(state: Dict[str, Any], m: TrackedMatch) -> bool:
-    """
-    Si SportsDB no permite consultar el evento (bloqueado),
-    migramos el seguimiento a API-SPORTS usando home/away/date_str.
-    """
     if not APISPORTS_KEY:
         return False
 
@@ -586,7 +573,6 @@ async def migrate_match_to_apisports(state: Dict[str, Any], m: TrackedMatch) -> 
     if not fixture_id:
         return False
 
-    # actualizar datos principales
     h_ev, a_ev = teams_from_apisports(fx)
     m.home = h_ev or m.home
     m.away = a_ev or m.away
@@ -595,17 +581,14 @@ async def migrate_match_to_apisports(state: Dict[str, Any], m: TrackedMatch) -> 
     m.league = league_from_apisports(fx) or m.league
     m.kickoff_local = ((fx.get("fixture") or {}).get("date") or m.kickoff_local)
 
-    # timeline ya no aplica
     m.seen_timeline_ids = []
 
-    # sincroniza marcador/estado actuales
     hs, aas = score_from_apisports(fx)
     st = status_from_apisports(fx)
     m.last_home = hs if hs is not None else m.last_home
     m.last_away = aas if aas is not None else m.last_away
     m.last_status = st or m.last_status
 
-    # si ya empezó, no queremos mandar "EMPIEZA" retroactivo
     bucket = status_bucket(st)
     if bucket == "INPLAY":
         m.started_notified = True
@@ -721,7 +704,6 @@ async def cmd_follow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     state = load_state()
     tracked = get_tracked(state)
 
-    # 1) intenta SportsDB (pero con verificación fuerte)
     provider = None
     match_id = ""
     ev = None
@@ -736,13 +718,11 @@ async def cmd_follow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     provider = "sportsdb"
                     match_id = cand_id
                 else:
-                    # encontrado "en teoría" pero NO usable => lo tratamos como bloqueado y pasamos a API-SPORTS
                     ev = None
         except Exception as e:
             log.info("SportsDB no usable en /seguir: %s", repr(e))
             ev = None
 
-    # 2) fallback real a API-SPORTS si SportsDB falló/bloqueado
     if provider is None:
         fx = await find_best_event_apisports(state, home, away, target_date)
         if fx:
@@ -792,7 +772,10 @@ async def cmd_follow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 await update.message.reply_text(f"ℹ️ Ya estabas siguiendo: {m.home} vs {m.away} ({m.date_str})")
             return
 
+    # ✅ Ajuste clave: si ya está FINAL, responder FINAL (no “YA INICIADO”)
     started_notified = (bucket == "INPLAY")
+    ft_notified = (bucket == "FINISHED")
+
     last_home = hs if hs is not None else None
     last_away = aas if aas is not None else None
 
@@ -811,7 +794,7 @@ async def cmd_follow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             last_status=status,
             started_notified=started_notified,
             ht_notified=False,
-            ft_notified=False,
+            ft_notified=ft_notified,
         )
     )
     set_tracked(state, tracked)
@@ -819,6 +802,13 @@ async def cmd_follow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     extra_pick = f" | pick={pick}" if pick else ""
     extra_provider = f" [{provider}]"
+
+    if bucket == "FINISHED":
+        await update.message.reply_text(
+            f"✅ Añadido: {h_ev} vs {a_ev} ({ev_date}){extra_pick}{extra_provider}\n"
+            f"🏁 FINAL: {fmt_score(h_ev, a_ev, hs, aas)}{fmt_pick(pick)}"
+        )
+        return
 
     if bucket == "INPLAY":
         min_txt = f" {minute}" if minute else ""
@@ -844,22 +834,17 @@ async def poll_once(app: Application) -> None:
     changed_any = False
 
     for m in tracked:
-        changed_this = False
         ev = None
         fx = None
 
-        # 0) consulta según provider
         try:
             if m.provider == "sportsdb":
                 ev = await fetch_event_by_id_sportsdb(m.match_id)
-                # Si SportsDB "se cae/bloquea": intentamos migrar a API-SPORTS
                 if not ev:
                     migrated = await migrate_match_to_apisports(state, m)
                     if migrated:
                         changed_any = True
-                        changed_this = True
                         await send_msg(app, f"🔁 Migrado a API-SPORTS: {m.home} vs {m.away} ({m.league}){fmt_pick(m.pick)}")
-                        # ya migrado, seguimos en este mismo tick con API-SPORTS
                         fx = await fetch_fixture_by_id_apisports(m.match_id)
                         ev = None
             else:
@@ -868,7 +853,6 @@ async def poll_once(app: Application) -> None:
             log.exception("Error consultando match provider=%s id=%s", m.provider, m.match_id)
             continue
 
-        # 1) parseo normalizado
         if m.provider == "sportsdb":
             if not ev:
                 continue
@@ -886,28 +870,21 @@ async def poll_once(app: Application) -> None:
             bucket = status_bucket(status)
             timeline_fetch = False
 
-        # 2) EMPIEZA
         if bucket == "INPLAY" and not m.started_notified:
             await send_msg(app, f"🔔 EMPIEZA: {home} vs {away} ({m.league}){fmt_pick(m.pick)}")
             m.started_notified = True
             changed_any = True
-            changed_this = True
 
-        # 3) DESCANSO
         if (status.upper() == "HT" or "HALF" in status.upper()) and not m.ht_notified:
             await send_msg(app, f"⏸ DESCANSO: {fmt_score(home, away, hs, aas)}{fmt_pick(m.pick)}")
             m.ht_notified = True
             changed_any = True
-            changed_this = True
 
-        # 4) FINAL
         if bucket == "FINISHED" and not m.ft_notified:
             await send_msg(app, f"🏁 FINAL: {fmt_score(home, away, hs, aas)}{fmt_pick(m.pick)}")
             m.ft_notified = True
             changed_any = True
-            changed_this = True
 
-        # 5) ANTI-VAR (retroceso marcador)
         if (
             m.last_home is not None and m.last_away is not None
             and hs is not None and aas is not None
@@ -917,17 +894,13 @@ async def poll_once(app: Application) -> None:
             now = fmt_score(home, away, hs, aas)
             await send_msg(app, f"🔄 CORRECCIÓN (posible VAR):\nAntes: {before}\nAhora: {now}{fmt_pick(m.pick)}")
             changed_any = True
-            changed_this = True
         else:
-            # 6) GOL (subida marcador)
             if m.last_home is not None and m.last_away is not None and hs is not None and aas is not None:
                 if hs > m.last_home or aas > m.last_away:
                     scorer = home if hs > m.last_home else away
                     await send_msg(app, f"⚽ GOL: {scorer}\n{fmt_score(home, away, hs, aas)}{fmt_pick(m.pick)}")
                     changed_any = True
-                    changed_this = True
 
-        # 7) Timeline (solo SportsDB)
         if timeline_fetch and bucket == "INPLAY":
             try:
                 tl = await fetch_timeline_sportsdb(m.match_id)
@@ -945,23 +918,18 @@ async def poll_once(app: Application) -> None:
                         await send_msg(app, msg)
                     m.seen_timeline_ids.append(key)
                     changed_any = True
-                    changed_this = True
             except Exception:
                 log.info("Timeline no disponible o error para %s", m.match_id)
 
-        # 8) Guardar estado (solo si cambió algo real)
         if hs is not None and hs != m.last_home:
             m.last_home = hs
             changed_any = True
-            changed_this = True
         if aas is not None and aas != m.last_away:
             m.last_away = aas
             changed_any = True
-            changed_this = True
         if status and status != m.last_status:
             m.last_status = status
             changed_any = True
-            changed_this = True
 
     if changed_any:
         set_tracked(state, tracked)
