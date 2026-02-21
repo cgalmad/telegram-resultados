@@ -10,11 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # =========================
 # CONFIG
@@ -26,15 +22,20 @@ logging.basicConfig(
 log = logging.getLogger("telegram-resultados")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0").strip())  # grupo destino
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0").strip())
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60").strip())
-SPORTSDB_KEY = os.getenv("SPORTSDB_KEY", "123").strip()  # TheSportsDB free shared key
 STATE_FILE = os.getenv("STATE_FILE", "state.json").strip()
 
+# Primary: TheSportsDB
+SPORTSDB_KEY = os.getenv("SPORTSDB_KEY", "123").strip()
 SPORTSDB_BASE = f"https://www.thesportsdb.com/api/v1/json/{SPORTSDB_KEY}"
 
-INPLAY_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "PEN"}  # defensivo
-FINISHED_STATUSES = {"FT", "AET", "PEN"}  # a veces PEN también es final
+# Secondary: API-SPORTS (optional)
+APISPORTS_KEY = os.getenv("APISPORTS_KEY", "").strip()
+APISPORTS_BASE = os.getenv("APISPORTS_BASE", "https://v3.football.api-sports.io").strip()
+
+INPLAY_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "PEN"}
+FINISHED_STATUSES = {"FT", "AET", "PEN"}
 
 # =========================
 # HELPERS
@@ -43,25 +44,17 @@ def _now_utc() -> datetime:
     return datetime.utcnow()
 
 def normalize_team(s: str) -> str:
-    """
-    Normaliza nombres: minúsculas, sin acentos, sin puntuación, y elimina tokens comunes.
-    """
     s = (s or "").strip().lower()
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-
     stop = {"fc", "cf", "sc", "ac", "cd", "ud", "afc", "the", "de", "la"}
     parts = [p for p in s.split() if p not in stop]
     return " ".join(parts)
 
 def parse_teams(text: str) -> Tuple[str, str]:
-    """
-    Espera: "Equipo A vs Equipo B" o "Equipo A - Equipo B"
-    """
-    t = text.strip()
-    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"\s+", " ", text.strip())
     if " vs " in t.lower():
         a, b = re.split(r"\s+vs\s+", t, flags=re.IGNORECASE, maxsplit=1)
     elif " - " in t:
@@ -71,9 +64,6 @@ def parse_teams(text: str) -> Tuple[str, str]:
     return a.strip(), b.strip()
 
 def parse_optional_date(parts: List[str]) -> Optional[date]:
-    """
-    Si el último token es YYYY-MM-DD lo interpreta como fecha.
-    """
     if not parts:
         return None
     last = parts[-1]
@@ -95,7 +85,6 @@ def safe_int(x: Any) -> Optional[int]:
 def status_bucket(status: str) -> str:
     s = (status or "").strip()
     s_up = s.upper()
-
     if s_up in INPLAY_STATUSES:
         return "INPLAY"
     if s_up in FINISHED_STATUSES:
@@ -118,12 +107,11 @@ def normalize_pick(p: str) -> str:
     p = (p or "").strip().upper()
     p = p.replace(" ", "")
     p = p.replace("Ó", "O")
+    # soporta cosas tipo O3.5 también
+    p = p.replace("OVER", "O")
     return p
 
 def parse_pick_from_tail(tail: str) -> str:
-    """
-    tail: parte derecha tras '|', ejemplo: 'pick=O2.5'
-    """
     if not tail:
         return ""
     m = re.search(r"(?:^|[\s,])pick\s*=\s*([A-Za-z0-9\.\+\-]+)", tail, flags=re.IGNORECASE)
@@ -138,9 +126,10 @@ def parse_pick_from_tail(tail: str) -> str:
 class TrackedMatch:
     home: str
     away: str
-    date_str: str  # YYYY-MM-DD (fecha objetivo)
-    event_id: str  # TheSportsDB idEvent
-    pick: str = ""  # PICK dentro de /seguir
+    date_str: str
+    match_id: str          # idEvent (SportsDB) o fixture.id (API-SPORTS)
+    provider: str = "sportsdb"  # "sportsdb" | "apisports"
+    pick: str = ""
 
     league: str = ""
     kickoff_local: str = ""
@@ -160,13 +149,18 @@ class TrackedMatch:
 
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_FILE):
-        return {"tracked": []}
+        return {"tracked": [], "team_cache": {}}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            js = json.load(f)
+        if "tracked" not in js:
+            js["tracked"] = []
+        if "team_cache" not in js:
+            js["team_cache"] = {}
+        return js
     except Exception:
         log.exception("No se pudo leer state.json, empezando limpio.")
-        return {"tracked": []}
+        return {"tracked": [], "team_cache": {}}
 
 def save_state(state: Dict[str, Any]) -> None:
     tmp = STATE_FILE + ".tmp"
@@ -175,10 +169,14 @@ def save_state(state: Dict[str, Any]) -> None:
     os.replace(tmp, STATE_FILE)
 
 def get_tracked(state: Dict[str, Any]) -> List[TrackedMatch]:
-    items = state.get("tracked", [])
     out: List[TrackedMatch] = []
-    for it in items:
+    for it in state.get("tracked", []):
         try:
+            # Backward compat: si viene event_id antiguo
+            if "match_id" not in it and "event_id" in it:
+                it = dict(it)
+                it["match_id"] = it.pop("event_id")
+                it["provider"] = it.get("provider", "sportsdb")
             out.append(TrackedMatch(**it))
         except Exception:
             log.exception("Entrada inválida en state.json, se ignora: %s", it)
@@ -188,40 +186,38 @@ def set_tracked(state: Dict[str, Any], matches: List[TrackedMatch]) -> None:
     state["tracked"] = [asdict(m) for m in matches]
 
 # =========================
-# API: TheSportsDB
+# HTTP
 # =========================
-async def http_get_json(url: str, params: Optional[dict] = None) -> dict:
+async def http_get_json(url: str, params: Optional[dict] = None, headers: Optional[dict] = None) -> dict:
     timeout = httpx.Timeout(20.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.get(url, params=params)
+        r = await client.get(url, params=params, headers=headers)
         r.raise_for_status()
         return r.json()
 
+# =========================
+# API: TheSportsDB (PRIMARY)
+# =========================
 async def fetch_events_for_day(d: date) -> List[dict]:
     url = f"{SPORTSDB_BASE}/eventsday.php"
     js = await http_get_json(url, params={"d": d.strftime("%Y-%m-%d"), "s": "Soccer"})
     return js.get("events") or []
 
-async def search_team_id(team_name: str) -> Optional[Tuple[str, str]]:
+async def search_team_id_sportsdb(team_name: str) -> Optional[Tuple[str, str]]:
     url = f"{SPORTSDB_BASE}/searchteams.php"
     js = await http_get_json(url, params={"t": team_name})
     teams = js.get("teams") or []
     if not teams:
         return None
-
     q = normalize_team(team_name)
-    best = None
-    best_score = -1
+    best, best_score = None, -1
     for t in teams:
         name = (t.get("strTeam") or "").strip()
         nt = normalize_team(name)
         sc = 0
-        if nt == q:
-            sc += 100
-        if q and q in nt:
-            sc += 40
-        if nt and nt in q:
-            sc += 20
+        if nt == q: sc += 100
+        if q and q in nt: sc += 40
+        if nt and nt in q: sc += 20
         if sc > best_score:
             best_score = sc
             best = t
@@ -243,60 +239,59 @@ async def fetch_team_events_window(team_id: str) -> List[dict]:
         pass
     return out
 
-def score_from_event(ev: dict) -> Tuple[Optional[int], Optional[int]]:
+def score_from_sportsdb(ev: dict) -> Tuple[Optional[int], Optional[int]]:
     return safe_int(ev.get("intHomeScore")), safe_int(ev.get("intAwayScore"))
 
-def status_from_event(ev: dict) -> str:
+def status_from_sportsdb(ev: dict) -> str:
     return (ev.get("strStatus") or "").strip()
 
-def teams_from_event(ev: dict) -> Tuple[str, str]:
+def teams_from_sportsdb(ev: dict) -> Tuple[str, str]:
     return (ev.get("strHomeTeam") or "").strip(), (ev.get("strAwayTeam") or "").strip()
 
+def minute_from_sportsdb(ev: dict) -> str:
+    # TheSportsDB puede traer strProgress ("70'") o intTime o similar
+    m = (ev.get("strProgress") or "").strip()
+    if m:
+        return m
+    mt = ev.get("intTime") or ev.get("strTime") or ""
+    mt = str(mt).strip()
+    # si strTime es hora, no nos sirve; lo dejamos vacío si parece HH:MM
+    if re.fullmatch(r"\d{2}:\d{2}(:\d{2})?", mt):
+        return ""
+    return mt
+
 def event_match_score(ev: dict, home_q: str, away_q: str) -> int:
-    h, a = teams_from_event(ev)
-    nh = normalize_team(h)
-    na = normalize_team(a)
-    qh = normalize_team(home_q)
-    qa = normalize_team(away_q)
+    h, a = teams_from_sportsdb(ev)
+    nh = normalize_team(h); na = normalize_team(a)
+    qh = normalize_team(home_q); qa = normalize_team(away_q)
 
     score = 0
-    if nh == qh:
-        score += 60
-    if na == qa:
-        score += 60
+    if nh == qh: score += 60
+    if na == qa: score += 60
+    if qh and qh in nh: score += 25
+    if qa and qa in na: score += 25
+    if nh == qa: score += 12
+    if na == qh: score += 12
 
-    if qh and qh in nh:
-        score += 25
-    if qa and qa in na:
-        score += 25
-
-    if nh == qa:
-        score += 12
-    if na == qh:
-        score += 12
-
-    bucket = status_bucket(status_from_event(ev))
-    if bucket == "INPLAY":
+    if status_bucket(status_from_sportsdb(ev)) == "INPLAY":
         score += 30
 
-    hs, as_ = score_from_event(ev)
+    hs, as_ = score_from_sportsdb(ev)
     if hs is not None or as_ is not None:
         score += 5
-
     return score
 
-async def find_best_event(home: str, away: str, target_date: Optional[date]) -> Optional[dict]:
+async def find_best_event_sportsdb(home: str, away: str, target_date: Optional[date]) -> Optional[dict]:
     if target_date is None:
         target_date = _now_utc().date()
 
-    # 1) DAY search
     candidates: List[dict] = []
     for delta in [0, -1, 1]:
         d = target_date + timedelta(days=delta)
         try:
             candidates.extend(await fetch_events_for_day(d))
         except Exception:
-            log.exception("Error pidiendo eventos del día %s", d)
+            log.exception("Error pidiendo eventsday %s", d)
 
     if candidates:
         scored = [(event_match_score(ev, home, away), ev) for ev in candidates]
@@ -305,9 +300,9 @@ async def find_best_event(home: str, away: str, target_date: Optional[date]) -> 
         if best_score >= 45:
             return best_ev
 
-    # 2) FALLBACK por equipo (cuando eventsday no trae esa liga)
+    # fallback por equipo (SportsDB)
     try:
-        home_team = await search_team_id(home)
+        home_team = await search_team_id_sportsdb(home)
         away_norm = normalize_team(away)
         if home_team:
             home_id, _ = home_team
@@ -318,38 +313,30 @@ async def find_best_event(home: str, away: str, target_date: Optional[date]) -> 
                 (target_date - timedelta(days=1)).strftime("%Y-%m-%d"),
                 (target_date + timedelta(days=1)).strftime("%Y-%m-%d"),
             }
-            evs2 = []
-            for ev in evs:
-                ev_date = (ev.get("dateEvent") or "").strip()
-                if ev_date and ev_date in dd:
-                    evs2.append(ev)
-            if not evs2:
-                evs2 = evs
+            evs2 = [ev for ev in evs if (ev.get("dateEvent") or "").strip() in dd] or evs
 
-            best = None
-            best_sc = -1
+            best, best_sc = None, -1
             for ev in evs2:
-                h, a = teams_from_event(ev)
+                h, a = teams_from_sportsdb(ev)
                 if away_norm and away_norm not in (normalize_team(h) + " " + normalize_team(a)):
                     continue
                 sc = event_match_score(ev, home, away)
                 if sc > best_sc:
-                    best_sc = sc
-                    best = ev
+                    best_sc, best = sc, ev
             if best and best_sc >= 40:
                 return best
     except Exception:
-        log.exception("Fallback por equipo falló")
+        log.exception("Fallback por equipo (SportsDB) falló")
 
     return None
 
-async def fetch_event_by_id(event_id: str) -> Optional[dict]:
+async def fetch_event_by_id_sportsdb(event_id: str) -> Optional[dict]:
     url = f"{SPORTSDB_BASE}/lookupevent.php"
     js = await http_get_json(url, params={"id": event_id})
     events = js.get("events") or []
     return events[0] if events else None
 
-async def fetch_timeline(event_id: str) -> List[dict]:
+async def fetch_timeline_sportsdb(event_id: str) -> List[dict]:
     url = f"{SPORTSDB_BASE}/lookuptimeline.php"
     js = await http_get_json(url, params={"id": event_id})
     return js.get("timeline") or []
@@ -362,12 +349,160 @@ def describe_timeline(item: dict) -> Optional[Tuple[str, str, str]]:
     minute = str(item.get("intTime") or item.get("strTime") or "").strip()
     team = (item.get("strTeam") or "").strip()
     ttype_low = ttype.lower()
-
     if "red" in ttype_low:
         return ("RED", minute, team)
     if "disallow" in ttype_low or "annul" in ttype_low or "cancel" in ttype_low:
         return ("DISALLOWED_GOAL", minute, team)
     return None
+
+# =========================
+# API: API-SPORTS (SECONDARY)
+# =========================
+def apisports_headers() -> dict:
+    return {"x-apisports-key": APISPORTS_KEY} if APISPORTS_KEY else {}
+
+def score_from_apisports(fx: dict) -> Tuple[Optional[int], Optional[int]]:
+    g = (fx.get("goals") or {})
+    return safe_int(g.get("home")), safe_int(g.get("away"))
+
+def status_from_apisports(fx: dict) -> str:
+    st = (fx.get("fixture") or {}).get("status") or {}
+    # short: "1H","2H","HT","FT"... / long: "First Half"...
+    return (st.get("short") or st.get("long") or "").strip()
+
+def minute_from_apisports(fx: dict) -> str:
+    st = (fx.get("fixture") or {}).get("status") or {}
+    el = st.get("elapsed")
+    if el is None:
+        return ""
+    try:
+        return f"{int(el)}'"
+    except Exception:
+        return ""
+
+def teams_from_apisports(fx: dict) -> Tuple[str, str]:
+    t = fx.get("teams") or {}
+    return (t.get("home") or {}).get("name", "").strip(), (t.get("away") or {}).get("name", "").strip()
+
+def league_from_apisports(fx: dict) -> str:
+    l = fx.get("league") or {}
+    return (l.get("name") or "").strip()
+
+async def apisports_team_id(state: Dict[str, Any], team_name: str) -> Optional[int]:
+    """
+    Cachea team_name_normalizado -> id
+    """
+    cache = state.get("team_cache", {}) or {}
+    key = normalize_team(team_name)
+    if key in cache:
+        try:
+            return int(cache[key])
+        except Exception:
+            pass
+
+    if not APISPORTS_KEY:
+        return None
+
+    url = f"{APISPORTS_BASE}/teams"
+    js = await http_get_json(url, params={"search": team_name}, headers=apisports_headers())
+    resp = js.get("response") or []
+    if not resp:
+        return None
+
+    best_id = None
+    best_sc = -1
+    for item in resp:
+        name = ((item.get("team") or {}).get("name") or "").strip()
+        tid = (item.get("team") or {}).get("id")
+        if not name or tid is None:
+            continue
+        nt = normalize_team(name)
+        q = key
+        sc = 0
+        if nt == q: sc += 100
+        if q and q in nt: sc += 40
+        if nt and nt in q: sc += 20
+        if sc > best_sc:
+            best_sc = sc
+            best_id = int(tid)
+
+    if best_id is None:
+        # fallback al primero
+        tid = (resp[0].get("team") or {}).get("id")
+        if tid is None:
+            return None
+        best_id = int(tid)
+
+    cache[key] = best_id
+    state["team_cache"] = cache
+    return best_id
+
+def match_score_apisports(fx: dict, home_q: str, away_q: str) -> int:
+    h, a = teams_from_apisports(fx)
+    nh = normalize_team(h); na = normalize_team(a)
+    qh = normalize_team(home_q); qa = normalize_team(away_q)
+    sc = 0
+    if nh == qh: sc += 60
+    if na == qa: sc += 60
+    if qh and qh in nh: sc += 25
+    if qa and qa in na: sc += 25
+    if nh == qa: sc += 12
+    if na == qh: sc += 12
+    if status_bucket(status_from_apisports(fx)) == "INPLAY":
+        sc += 30
+    hs, as_ = score_from_apisports(fx)
+    if hs is not None or as_ is not None:
+        sc += 5
+    return sc
+
+async def find_best_event_apisports(state: Dict[str, Any], home: str, away: str, target_date: Optional[date]) -> Optional[dict]:
+    """
+    Estrategia: resolver team_id(home), pedir fixtures por date+team, filtrar por rival.
+    3 requests típicos: teams(home) + teams(away) (a veces cache) + fixtures(team+date)
+    """
+    if not APISPORTS_KEY:
+        return None
+
+    if target_date is None:
+        target_date = _now_utc().date()
+
+    home_id = await apisports_team_id(state, home)
+    away_id = await apisports_team_id(state, away)  # no imprescindible, pero ayuda a filtrar
+    if home_id is None:
+        return None
+
+    # date exacta y ±1
+    best = None
+    best_sc = -1
+
+    for delta in [0, -1, 1]:
+        d = target_date + timedelta(days=delta)
+        url = f"{APISPORTS_BASE}/fixtures"
+        js = await http_get_json(url, params={"date": d.strftime("%Y-%m-%d"), "team": home_id}, headers=apisports_headers())
+        resp = js.get("response") or []
+        for fx in resp:
+            # filtrar por rival si podemos
+            if away_id is not None:
+                th = ((fx.get("teams") or {}).get("home") or {}).get("id")
+                ta = ((fx.get("teams") or {}).get("away") or {}).get("id")
+                if away_id not in {th, ta}:
+                    continue
+            sc = match_score_apisports(fx, home, away)
+            if sc > best_sc:
+                best_sc = sc
+                best = fx
+
+    if best and best_sc >= 45:
+        return best
+    return None
+
+async def fetch_fixture_by_id_apisports(fixture_id: str) -> Optional[dict]:
+    if not APISPORTS_KEY:
+        return None
+    url = f"{APISPORTS_BASE}/fixtures"
+    js = await http_get_json(url, params={"id": fixture_id}, headers=apisports_headers())
+    resp = js.get("response") or []
+    return resp[0] if resp else None
 
 # =========================
 # TELEGRAM OUTPUT
@@ -400,7 +535,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /lista\n"
         "• /borrar <equipo1> vs <equipo2> [YYYY-MM-DD]\n"
         "• /limpiar\n"
-        f"\nTick: {fmt_minutes()}"
+        f"\nTick: {fmt_minutes()}\n"
+        f"Fallback API-SPORTS: {'ON' if APISPORTS_KEY else 'OFF (APISPORTS_KEY vacío)'}"
     )
     await update.message.reply_text(help_text)
 
@@ -413,11 +549,13 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["Partidos seguidos:"]
     for m in tracked:
         p = f" | pick={m.pick}" if m.pick else ""
-        lines.append(f"• {m.home} vs {m.away} ({m.date_str}){p}")
+        prov = f" [{m.provider}]"
+        lines.append(f"• {m.home} vs {m.away} ({m.date_str}){p}{prov}")
     await update.message.reply_text("\n".join(lines))
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state = {"tracked": []}
+    state = load_state()
+    state["tracked"] = []
     save_state(state)
     await update.message.reply_text("✅ Lista limpiada.")
 
@@ -472,7 +610,6 @@ async def cmd_follow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     left, tail = (raw.split("|", 1) + [""])[:2]
     left = left.strip()
     tail = tail.strip()
-
     pick = parse_pick_from_tail(tail)
 
     parts = left.split()
@@ -490,22 +627,54 @@ async def cmd_follow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(str(e))
         return
 
-    ev = await find_best_event(home, away, target_date)
-    if not ev:
-        await update.message.reply_text("❌ No encontré ese partido (ni en ±1 día). Prueba con nombres más exactos o sin fecha.")
-        return
-
-    h_ev, a_ev = teams_from_event(ev)
-    ev_id = str(ev.get("idEvent") or "").strip()
-    ev_date = (ev.get("dateEvent") or (target_date.strftime("%Y-%m-%d") if target_date else _now_utc().date().strftime("%Y-%m-%d"))).strip()
-    league = (ev.get("strLeague") or "").strip()
-    kickoff_local = (ev.get("strTimeLocal") or ev.get("strTime") or "").strip()
-
     state = load_state()
     tracked = get_tracked(state)
 
+    # 1) intenta SportsDB
+    ev = await find_best_event_sportsdb(home, away, target_date)
+    provider = "sportsdb"
+
+    # 2) si falla, intenta API-SPORTS (solo en /seguir)
+    fx = None
+    if not ev:
+        fx = await find_best_event_apisports(state, home, away, target_date)
+        if fx:
+            provider = "apisports"
+
+    if not ev and not fx:
+        extra = ""
+        if not APISPORTS_KEY:
+            extra = "\n(Nota: APISPORTS_KEY no está configurado, así que no pude usar el fallback.)"
+        await update.message.reply_text("❌ No encontré ese partido (ni en ±1 día). Prueba con nombres más exactos o sin fecha." + extra)
+        return
+
+    # Normaliza datos según provider
+    if provider == "sportsdb":
+        h_ev, a_ev = teams_from_sportsdb(ev)
+        match_id = str(ev.get("idEvent") or "").strip()
+        ev_date = (ev.get("dateEvent") or (target_date.strftime("%Y-%m-%d") if target_date else _now_utc().date().strftime("%Y-%m-%d"))).strip()
+        league = (ev.get("strLeague") or "").strip()
+        kickoff_local = (ev.get("strTimeLocal") or ev.get("strTime") or "").strip()
+        hs, aas = score_from_sportsdb(ev)
+        status = status_from_sportsdb(ev)
+        minute = minute_from_sportsdb(ev)
+        bucket = status_bucket(status)
+    else:
+        h_ev, a_ev = teams_from_apisports(fx)
+        match_id = str(((fx.get("fixture") or {}).get("id")) or "").strip()
+        # fecha ISO
+        dt_iso = ((fx.get("fixture") or {}).get("date") or "").strip()
+        ev_date = (dt_iso[:10] if dt_iso else (target_date.strftime("%Y-%m-%d") if target_date else _now_utc().date().strftime("%Y-%m-%d")))
+        league = league_from_apisports(fx)
+        kickoff_local = dt_iso
+        hs, aas = score_from_apisports(fx)
+        status = status_from_apisports(fx)
+        minute = minute_from_apisports(fx)
+        bucket = status_bucket(status)
+
+    # evita duplicados por (provider, match_id)
     for m in tracked:
-        if m.event_id == ev_id:
+        if m.provider == provider and m.match_id == match_id:
             changed = False
             if pick and pick != (m.pick or ""):
                 m.pick = pick
@@ -518,22 +687,47 @@ async def cmd_follow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 await update.message.reply_text(f"ℹ️ Ya estabas siguiendo: {m.home} vs {m.away} ({m.date_str})")
             return
 
+    # si ya viene en juego: marcamos started_notified y guardamos marcador para que no dispare "EMPIEZA" y no cuente goles antiguos
+    started_notified = (bucket == "INPLAY")
+    last_home = hs if hs is not None else None
+    last_away = aas if aas is not None else None
+
     tracked.append(
         TrackedMatch(
             home=h_ev or home,
             away=a_ev or away,
             date_str=ev_date,
-            event_id=ev_id,
+            match_id=match_id,
+            provider=provider,
             pick=pick,
             league=league,
             kickoff_local=kickoff_local,
+            last_home=last_home,
+            last_away=last_away,
+            last_status=status,
+            started_notified=started_notified,
+            ht_notified=False,
+            ft_notified=False,
         )
     )
     set_tracked(state, tracked)
     save_state(state)
 
-    extra = f" | pick={pick}" if pick else ""
-    await update.message.reply_text(f"✅ Añadido: {h_ev} vs {a_ev} ({ev_date}){extra}. Actualizo cada {fmt_minutes()}.")
+    extra_pick = f" | pick={pick}" if pick else ""
+    extra_provider = f" [{provider}]"
+
+    # Respuesta mejorada al añadir
+    if bucket == "INPLAY":
+        min_txt = f" {minute}" if minute else ""
+        await update.message.reply_text(
+            f"✅ Añadido: {h_ev} vs {a_ev} ({ev_date}){extra_pick}{extra_provider}\n"
+            f"🟢 YA INICIADO{min_txt}: {fmt_score(h_ev, a_ev, hs, aas)}"
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ Añadido: {h_ev} vs {a_ev} ({ev_date}){extra_pick}{extra_provider}. "
+            f"Actualizo cada {fmt_minutes()}."
+        )
 
 # =========================
 # POLLING JOB
@@ -547,19 +741,35 @@ async def poll_once(app: Application) -> None:
     changed_any = False
 
     for m in tracked:
+        ev = None
+        fx = None
+
         try:
-            ev = await fetch_event_by_id(m.event_id)
+            if m.provider == "sportsdb":
+                ev = await fetch_event_by_id_sportsdb(m.match_id)
+            else:
+                fx = await fetch_fixture_by_id_apisports(m.match_id)
         except Exception:
-            log.exception("Error consultando evento id=%s", m.event_id)
+            log.exception("Error consultando match provider=%s id=%s", m.provider, m.match_id)
             continue
 
-        if not ev:
-            continue
-
-        home, away = teams_from_event(ev)
-        hs, aas = score_from_event(ev)
-        status = status_from_event(ev)
-        bucket = status_bucket(status)
+        if m.provider == "sportsdb":
+            if not ev:
+                continue
+            home, away = teams_from_sportsdb(ev)
+            hs, aas = score_from_sportsdb(ev)
+            status = status_from_sportsdb(ev)
+            bucket = status_bucket(status)
+            # timeline solo sportsdb
+            timeline_fetch = True
+        else:
+            if not fx:
+                continue
+            home, away = teams_from_apisports(fx)
+            hs, aas = score_from_apisports(fx)
+            status = status_from_apisports(fx)
+            bucket = status_bucket(status)
+            timeline_fetch = False
 
         # 1) EMPIEZA
         if bucket == "INPLAY" and not m.started_notified:
@@ -579,8 +789,7 @@ async def poll_once(app: Application) -> None:
             m.ft_notified = True
             changed_any = True
 
-        # 4) ANTI-VAR: si el marcador "retrocede" respecto al último guardado, avisar corrección
-        #    (típico: gol anulado / corrección data provider)
+        # 4) ANTI-VAR (retroceso marcador)
         if (
             m.last_home is not None and m.last_away is not None
             and hs is not None and aas is not None
@@ -588,27 +797,20 @@ async def poll_once(app: Application) -> None:
         ):
             before = fmt_score(home, away, m.last_home, m.last_away)
             now = fmt_score(home, away, hs, aas)
-            await send_msg(
-                app,
-                f"🔄 CORRECCIÓN (posible VAR):\nAntes: {before}\nAhora: {now}{fmt_pick(m.pick)}"
-            )
+            await send_msg(app, f"🔄 CORRECCIÓN (posible VAR):\nAntes: {before}\nAhora: {now}{fmt_pick(m.pick)}")
             changed_any = True
-            # Nota: seguimos, pero NO disparamos "GOL" en este tick.
         else:
-            # 5) GOL por delta de marcador (solo cuando sube)
+            # 5) GOL (subida marcador)
             if m.last_home is not None and m.last_away is not None and hs is not None and aas is not None:
                 if hs > m.last_home or aas > m.last_away:
                     scorer = home if hs > m.last_home else away
-                    await send_msg(
-                        app,
-                        f"⚽ GOL: {scorer}\n{fmt_score(home, away, hs, aas)}{fmt_pick(m.pick)}"
-                    )
+                    await send_msg(app, f"⚽ GOL: {scorer}\n{fmt_score(home, away, hs, aas)}{fmt_pick(m.pick)}")
                     changed_any = True
 
-        # 6) Timeline: rojas / anulados (solo INPLAY)
-        if bucket == "INPLAY":
+        # 6) Timeline (solo SportsDB)
+        if timeline_fetch and bucket == "INPLAY":
             try:
-                tl = await fetch_timeline(m.event_id)
+                tl = await fetch_timeline_sportsdb(m.match_id)
                 for item in tl:
                     key = timeline_key(item)
                     if key in m.seen_timeline_ids:
@@ -624,9 +826,9 @@ async def poll_once(app: Application) -> None:
                     m.seen_timeline_ids.append(key)
                     changed_any = True
             except Exception:
-                log.info("Timeline no disponible o error para %s", m.event_id)
+                log.info("Timeline no disponible o error para %s", m.match_id)
 
-        # 7) Guardar nuevo estado (siempre)
+        # 7) Guardar estado
         m.last_home = hs if hs is not None else m.last_home
         m.last_away = aas if aas is not None else m.last_away
         m.last_status = status
