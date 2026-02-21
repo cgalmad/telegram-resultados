@@ -1,110 +1,180 @@
 import os
+import json
 import logging
-import requests
+import asyncio
+from typing import Dict, Any, List, Optional
+
+import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+)
+log = logging.getLogger("telegram-resultados")
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-API_FOOTBALL_KEY = os.environ["API_FOOTBALL_KEY"]
-API_FOOTBALL_HOST = os.environ.get("API_FOOTBALL_HOST", "v3.football.api-sports.io")
-TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])
 
-TRACKED_FIXTURES = set()
-LAST_STATE = {}  # fixture_id -> (status, home_goals, away_goals)
+def env(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(f"Missing environment variable: {name}")
+    return v
 
-def api_football_get(path, params=None):
-    url = f"https://{API_FOOTBALL_HOST}{path}"
+
+TELEGRAM_TOKEN = env("TELEGRAM_TOKEN")
+API_FOOTBALL_KEY = env("API_FOOTBALL_KEY")
+API_FOOTBALL_HOST = os.getenv("API_FOOTBALL_HOST", "v3.football.api-sports.io")
+TARGET_CHAT_ID = int(env("TARGET_CHAT_ID"))
+
+API_BASE = f"https://{API_FOOTBALL_HOST}"
+
+STATE_FILE = "state.json"
+DEFAULT_STATE = {"fixtures": [], "last": {}}  # last: fixture_id -> {"status":..., "score":"H-A"}
+
+
+def load_state() -> Dict[str, Any]:
+    if not os.path.exists(STATE_FILE):
+        return DEFAULT_STATE.copy()
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if "fixtures" not in data or "last" not in data:
+            return DEFAULT_STATE.copy()
+        return data
+    except Exception:
+        return DEFAULT_STATE.copy()
+
+
+def save_state(state: Dict[str, Any]) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+async def api_get_fixture(client: httpx.AsyncClient, fixture_id: int) -> Optional[Dict[str, Any]]:
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
-    r = requests.get(url, headers=headers, params=params, timeout=20)
+    params = {"id": fixture_id}
+    r = await client.get(f"{API_BASE}/fixtures", headers=headers, params=params, timeout=20)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    resp = data.get("response") or []
+    if not resp:
+        return None
+    return resp[0]
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "✅ Bot activo.\n"
-        "Comandos:\n"
-        "/addfixture <fixture_id>\n"
-        "/list\n"
-        "/clear\n"
-        "Publicaré cambios y resultados finales en el grupo."
-    )
 
-async def addfixture(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def format_line(fx: Dict[str, Any]) -> str:
+    fixture = fx.get("fixture", {})
+    teams = fx.get("teams", {})
+    goals = fx.get("goals", {})
+
+    home = (teams.get("home") or {}).get("name", "Home")
+    away = (teams.get("away") or {}).get("name", "Away")
+    gh = goals.get("home")
+    ga = goals.get("away")
+
+    status = (fixture.get("status") or {}).get("short", "")
+    minute = (fixture.get("status") or {}).get("elapsed", None)
+    time_part = f"{minute}'" if isinstance(minute, int) else status
+
+    score = f"{gh}-{ga}" if gh is not None and ga is not None else "—"
+    return f"{home} vs {away} | {score} | {time_part}"
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Bot activo. Usa /addfixture <id>, /list, /clear")
+
+
+async def cmd_addfixture(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Uso: /addfixture <fixture_id>")
         return
     try:
-        fid = int(context.args[0])
+        fixture_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("fixture_id inválido.")
+        await update.message.reply_text("El fixture_id debe ser un número.")
         return
 
-    TRACKED_FIXTURES.add(fid)
-    await update.message.reply_text(f"➕ Añadido fixture_id: {fid}")
-
-async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not TRACKED_FIXTURES:
-        await update.message.reply_text("No hay partidos en seguimiento.")
+    state = load_state()
+    fixtures: List[int] = state["fixtures"]
+    if fixture_id in fixtures:
+        await update.message.reply_text(f"Ya estaba añadido: {fixture_id}")
         return
-    await update.message.reply_text("📌 En seguimiento:\n" + "\n".join(map(str, sorted(TRACKED_FIXTURES))))
+    fixtures.append(fixture_id)
+    save_state(state)
+    await update.message.reply_text(f"✅ Añadido fixture: {fixture_id}")
 
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    TRACKED_FIXTURES.clear()
-    LAST_STATE.clear()
-    await update.message.reply_text("🧹 Limpio. Sin partidos en seguimiento.")
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
+    fixtures: List[int] = state["fixtures"]
+    if not fixtures:
+        await update.message.reply_text("No hay fixtures guardados. Usa /addfixture <id>.")
+        return
+    await update.message.reply_text("📌 Fixtures:\n" + "\n".join(f"- {x}" for x in fixtures))
+
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_state(DEFAULT_STATE.copy())
+    await update.message.reply_text("🧹 Lista limpiada.")
+
 
 async def poll_results(app: Application):
-    if not TRACKED_FIXTURES:
+    state = load_state()
+    fixtures: List[int] = state["fixtures"]
+    if not fixtures:
         return
 
-    for fid in list(TRACKED_FIXTURES):
-        try:
-            data = api_football_get("/fixtures", params={"id": fid})
-            resp = data.get("response", [])
-            if not resp:
-                continue
+    async with httpx.AsyncClient() as client:
+        for fid in fixtures:
+            try:
+                fx = await api_get_fixture(client, fid)
+                if not fx:
+                    continue
 
-            fx = resp[0]
-            status = fx["fixture"]["status"]["short"]
-            elapsed = fx["fixture"]["status"].get("elapsed")
-            home = fx["teams"]["home"]["name"]
-            away = fx["teams"]["away"]["name"]
-            hg = fx["goals"]["home"]
-            ag = fx["goals"]["away"]
+                fixture = fx.get("fixture", {})
+                status = (fixture.get("status") or {}).get("short", "")
+                goals = fx.get("goals", {})
+                gh = goals.get("home")
+                ga = goals.get("away")
+                score = f"{gh}-{ga}" if gh is not None and ga is not None else "—"
 
-            key = (status, hg, ag)
-            prev = LAST_STATE.get(fid)
+                last = state["last"].get(str(fid))
+                changed = (last is None) or (last.get("status") != status) or (last.get("score") != score)
 
-            if prev != key:
-                LAST_STATE[fid] = key
+                if changed:
+                    line = format_line(fx)
+                    await app.bot.send_message(chat_id=TARGET_CHAT_ID, text=f"⚽️ {line}")
+                    state["last"][str(fid)] = {"status": status, "score": score}
+                    save_state(state)
 
-                if status == "FT":
-                    msg = f"🏁 FINAL\n{home} {hg} - {ag} {away}"
-                    await app.bot.send_message(chat_id=TARGET_CHAT_ID, text=msg)
-                else:
-                    minute = f"{elapsed}' " if elapsed else ""
-                    msg = f"⚽ {minute}{home} {hg} - {ag} {away} ({status})"
-                    await app.bot.send_message(chat_id=TARGET_CHAT_ID, text=msg)
+            except Exception as e:
+                log.warning("Error en fixture %s: %s", fid, e)
 
-        except Exception as e:
-            logging.exception(f"Error polling fixture {fid}: {e}")
 
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("addfixture", addfixture))
-    app.add_handler(CommandHandler("list", listcmd))
-    app.add_handler(CommandHandler("clear", clear))
+async def on_startup(app: Application):
+    log.info("Bot started. Target chat id: %s", TARGET_CHAT_ID)
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(poll_results, "interval", seconds=90, args=[app])
+    # cada 60s (ajusta si quieres)
+    scheduler.add_job(lambda: asyncio.create_task(poll_results(app)), "interval", seconds=60)
     scheduler.start()
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+def main():
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("addfixture", cmd_addfixture))
+    application.add_handler(CommandHandler("list", cmd_list))
+    application.add_handler(CommandHandler("clear", cmd_clear))
+
+    application.post_init = on_startup
+
+    # IMPORTANTE: esto es lo que “escucha” comandos
+    application.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
