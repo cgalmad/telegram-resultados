@@ -1,58 +1,53 @@
 import os
 import re
 import json
-import asyncio
+import time
 import logging
-from dataclasses import dataclass, asdict
-from typing import Dict, Optional, List, Tuple
+from dataclasses import dataclass, asdict, field
+from typing import Dict, Optional, List, Tuple, Set
 from datetime import datetime, timedelta, date
 
 import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# -----------------------
-# Config
-# -----------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("telegram-resultados")
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])
 
-SPORTSDB_KEY = os.getenv("SPORTSDB_KEY", "3").strip()  # demo por defecto
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))  # 5 min por defecto
+# TheSportsDB: en free demo se usa 123 (compartida)
+SPORTSDB_KEY = os.getenv("SPORTSDB_KEY", "123").strip()
 SPORT = os.getenv("SPORT", "Soccer")
 
-# Fichero local (best-effort). En Railway puede perderse tras redeploy, pero sirve para reinicios del proceso.
+# Tick del job (se ejecuta cada 60s)
+TICK_SECONDS = int(os.getenv("TICK_SECONDS", "60"))
+# Si no hay partidos en juego, hacemos polling "fuerte" cada 300s (5 min)
+IDLE_POLL_SECONDS = int(os.getenv("IDLE_POLL_SECONDS", "300"))
+
 STATE_FILE = os.getenv("STATE_FILE", "/tmp/tracked_matches.json")
 
-# TheSportsDB base
 TSDB_BASE = f"https://www.thesportsdb.com/api/v1/json/{SPORTSDB_KEY}"
 
-# -----------------------
-# Helpers
-# -----------------------
+# --- Normalización/matching ---
 def _norm(s: str) -> str:
-    """Normaliza para matching flexible."""
-    s = s.lower().strip()
+    s = (s or "").lower().strip()
     s = s.replace("&", "and")
     s = re.sub(r"[\.\,\-\_\(\)\[\]\/\\]", " ", s)
     s = re.sub(r"\s+", " ", s)
     return s
 
+def _parse_date_arg(arg: Optional[str]) -> Optional[str]:
+    if not arg:
+        return None
+    arg = arg.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", arg):
+        return arg
+    return None
+
 def _looks_like_vs(text: str) -> Optional[Tuple[str, str]]:
-    """
-    Acepta:
-      /seguir Team A vs Team B
-      /seguir Team A - Team B
-      /seguir Team A v Team B
-    """
     text = text.strip()
-    # separadores típicos
     for sep in [" vs ", " v ", " - ", "—", "–"]:
         if sep in text.lower():
             parts = re.split(sep, text, flags=re.IGNORECASE)
@@ -62,69 +57,6 @@ def _looks_like_vs(text: str) -> Optional[Tuple[str, str]]:
                 if home and away:
                     return home, away
     return None
-
-def _parse_date_arg(arg: Optional[str]) -> Optional[str]:
-    """Devuelve YYYY-MM-DD o None."""
-    if not arg:
-        return None
-    arg = arg.strip()
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", arg):
-        return arg
-    return None
-
-@dataclass
-class TrackedMatch:
-    home: str
-    away: str
-    match_date: str  # YYYY-MM-DD
-    id_event: Optional[str] = None
-
-    # estado
-    last_status: Optional[str] = None
-    last_home_score: Optional[int] = None
-    last_away_score: Optional[int] = None
-    finished: bool = False
-
-# En memoria
-TRACKED: Dict[str, TrackedMatch] = {}  # key -> TrackedMatch
-
-
-def _make_key(home: str, away: str, match_date: str) -> str:
-    return f"{_norm(home)}__{_norm(away)}__{match_date}"
-
-def load_state() -> None:
-    global TRACKED
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            tmp: Dict[str, TrackedMatch] = {}
-            for k, v in raw.items():
-                tmp[k] = TrackedMatch(**v)
-            TRACKED = tmp
-            log.info("Loaded state: %d tracked matches", len(TRACKED))
-    except Exception as e:
-        log.warning("Could not load state: %s", e)
-
-def save_state() -> None:
-    try:
-        raw = {k: asdict(v) for k, v in TRACKED.items()}
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(raw, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.warning("Could not save state: %s", e)
-
-def is_finished_status(status: Optional[str]) -> bool:
-    if not status:
-        return False
-    s = status.strip().lower()
-    # TheSportsDB suele: "FT", "AET", "PEN", "Match Finished"
-    return s in {"ft", "aet", "pen", "match finished", "finished"} or "finished" in s
-
-def pretty_status(status: Optional[str]) -> str:
-    if not status:
-        return "?"
-    return status
 
 def safe_int(x) -> Optional[int]:
     try:
@@ -138,13 +70,79 @@ def safe_int(x) -> Optional[int]:
     except Exception:
         return None
 
-# -----------------------
-# TheSportsDB calls
-# -----------------------
+def is_live_status(status: Optional[str]) -> bool:
+    if not status:
+        return False
+    s = status.strip().lower()
+    # TheSportsDB suele usar: 1H, 2H, HT, ET, PEN, AET, Live
+    return s in {"1h", "2h", "ht", "et", "pen", "aet", "live"} or "half" in s or "time" in s
+
+def is_ht_status(status: Optional[str]) -> bool:
+    if not status:
+        return False
+    s = status.strip().lower()
+    return s in {"ht", "half time", "halftime"}
+
+def is_finished_status(status: Optional[str]) -> bool:
+    if not status:
+        return False
+    s = status.strip().lower()
+    return s in {"ft", "aet", "pen", "match finished", "finished"} or "finished" in s
+
+def pretty_status(status: Optional[str]) -> str:
+    return status or "?"
+
+@dataclass
+class TrackedMatch:
+    home: str
+    away: str
+    match_date: str  # YYYY-MM-DD
+    id_event: Optional[str] = None
+
+    last_status: Optional[str] = None
+    last_home_score: Optional[int] = None
+    last_away_score: Optional[int] = None
+    finished: bool = False
+
+    # Para no repetir eventos de timeline
+    seen_timeline_keys: Set[str] = field(default_factory=set)
+
+TRACKED: Dict[str, TrackedMatch] = {}
+LAST_HEAVY_POLL_TS: float = 0.0  # para idle mode
+
+def _make_key(home: str, away: str, match_date: str) -> str:
+    return f"{_norm(home)}__{_norm(away)}__{match_date}"
+
+def load_state() -> None:
+    global TRACKED
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            tmp: Dict[str, TrackedMatch] = {}
+            for k, v in raw.items():
+                v.setdefault("seen_timeline_keys", [])
+                v["seen_timeline_keys"] = set(v["seen_timeline_keys"])
+                tmp[k] = TrackedMatch(**v)
+            TRACKED = tmp
+            log.info("Loaded state: %d matches", len(TRACKED))
+    except Exception as e:
+        log.warning("Could not load state: %s", e)
+
+def save_state() -> None:
+    try:
+        raw = {}
+        for k, tm in TRACKED.items():
+            d = asdict(tm)
+            d["seen_timeline_keys"] = sorted(list(tm.seen_timeline_keys))
+            raw[k] = d
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(raw, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("Could not save state: %s", e)
+
+# --- TheSportsDB API ---
 async def fetch_events_day(client: httpx.AsyncClient, d: str) -> List[dict]:
-    """
-    GET /eventsday.php?d=YYYY-MM-DD&s=Soccer
-    """
     url = f"{TSDB_BASE}/eventsday.php"
     params = {"d": d, "s": SPORT}
     r = await client.get(url, params=params, timeout=20)
@@ -152,27 +150,30 @@ async def fetch_events_day(client: httpx.AsyncClient, d: str) -> List[dict]:
     data = r.json()
     return data.get("events") or []
 
+async def fetch_timeline(client: httpx.AsyncClient, id_event: str) -> List[dict]:
+    # Endpoint: lookuptimeline.php?id=EVENT
+    url = f"{TSDB_BASE}/lookuptimeline.php"
+    params = {"id": id_event}
+    r = await client.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    # suele venir en "timeline"
+    return data.get("timeline") or data.get("timelines") or []
+
 def find_event_for_match(events: List[dict], tm: TrackedMatch) -> Optional[dict]:
-    """
-    Matching flexible: primero por id_event si existe,
-    si no, por home/away normalizados.
-    """
     if tm.id_event:
         for ev in events:
             if str(ev.get("idEvent")) == str(tm.id_event):
                 return ev
 
-    nh = _norm(tm.home)
-    na = _norm(tm.away)
+    nh, na = _norm(tm.home), _norm(tm.away)
 
-    # 1) match directo por home/away
     for ev in events:
         eh = _norm(ev.get("strHomeTeam") or "")
         ea = _norm(ev.get("strAwayTeam") or "")
         if eh == nh and ea == na:
             return ev
 
-    # 2) match "contiene" (por si hay FC, AC, etc)
     def contains(a: str, b: str) -> bool:
         return (a in b) or (b in a)
 
@@ -184,78 +185,102 @@ def find_event_for_match(events: List[dict], tm: TrackedMatch) -> Optional[dict]
 
     return None
 
-def format_scoreline(tm: TrackedMatch, status: Optional[str], hs: Optional[int], as_: Optional[int]) -> str:
-    hname = tm.home
-    aname = tm.away
-    hs_str = "?" if hs is None else str(hs)
-    as_str = "?" if as_ is None else str(as_)
-    st = pretty_status(status)
-    return f"{hname} {hs_str}-{as_str} {aname} ({st})"
+def scoreline(tm: TrackedMatch, status: Optional[str], hs: Optional[int], as_: Optional[int]) -> str:
+    hs_s = "?" if hs is None else str(hs)
+    as_s = "?" if as_ is None else str(as_)
+    return f"{tm.home} {hs_s}-{as_s} {tm.away} ({pretty_status(status)})"
 
-# -----------------------
-# Bot commands
-# -----------------------
+def timeline_key(item: dict) -> str:
+    # Creamos una clave estable para no repetir
+    # (minuto + tipo + texto + equipo + jugador)
+    t = str(item.get("strTimeline") or item.get("strEvent") or item.get("strType") or "")
+    m = str(item.get("intTime") or item.get("strTime") or item.get("strTimeLine") or "")
+    p = str(item.get("strPlayer") or item.get("strPlayerName") or "")
+    te = str(item.get("strTeam") or item.get("strSide") or "")
+    ex = str(item.get("strExtra") or item.get("strAssist") or "")
+    return _norm(f"{m}|{t}|{p}|{te}|{ex}")
+
+def classify_timeline(item: dict) -> Tuple[Optional[str], str]:
+    """
+    Devuelve (tipo, detalle). tipo ∈ {"goal","red","disallowed"} o None
+    """
+    text = (item.get("strTimeline") or item.get("strEvent") or item.get("strType") or "")
+    text_n = _norm(text)
+
+    # Intentos de detección genérica
+    if "red" in text_n and "card" in text_n:
+        return "red", text.strip() or "Red card"
+
+    # Algunos timelines marcan gol como "Goal" o similar
+    if "goal" in text_n:
+        # si menciona anulaciones
+        if "disallow" in text_n or "var" in text_n or "no goal" in text_n or "overturn" in text_n:
+            return "disallowed", text.strip() or "Disallowed goal"
+        return "goal", text.strip() or "Goal"
+
+    # Si no aparece "goal", pero hay VAR/disallowed explícito
+    if "disallow" in text_n or ("var" in text_n and "goal" in text_n):
+        return "disallowed", text.strip() or "Disallowed goal"
+
+    return None, text.strip()
+
+# --- Bot Commands ---
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat and update.effective_chat.id != TARGET_CHAT_ID:
-        return  # ignorar fuera del grupo objetivo
-
+        return
     msg = (
         "Bot activo ✅\n\n"
         "Comandos:\n"
         "• /seguir <equipo1> vs <equipo2> [YYYY-MM-DD]\n"
-        "   Ej: /seguir Lecce vs Inter Milan 2026-02-21\n"
-        "   Si no pones fecha, usa hoy.\n"
+        "  Ej: /seguir Lecce vs Inter Milan 2026-02-21\n"
         "• /lista\n"
         "• /borrar <equipo1> vs <equipo2> [YYYY-MM-DD]\n"
-        "• /limpiar\n"
+        "• /limpiar\n\n"
+        f"Tick: {TICK_SECONDS}s | Idle poll: {IDLE_POLL_SECONDS}s"
     )
     await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=msg)
 
 async def cmd_seguir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat and update.effective_chat.id != TARGET_CHAT_ID:
         return
-
     text = " ".join(context.args).strip()
     if not text:
         await context.bot.send_message(chat_id=TARGET_CHAT_ID, text="Uso: /seguir Equipo A vs Equipo B [YYYY-MM-DD]")
         return
 
-    # intenta detectar fecha al final
     parts = text.split()
     maybe_date = _parse_date_arg(parts[-1]) if parts else None
     if maybe_date:
-        date_str = maybe_date
-        text_teams = " ".join(parts[:-1]).strip()
+        d = maybe_date
+        teams_text = " ".join(parts[:-1]).strip()
     else:
-        date_str = date.today().isoformat()
-        text_teams = text
+        d = date.today().isoformat()
+        teams_text = text
 
-    vs = _looks_like_vs(text_teams)
+    vs = _looks_like_vs(teams_text)
     if not vs:
-        await context.bot.send_message(chat_id=TARGET_CHAT_ID, text="No entiendo el formato. Ej: /seguir Roma vs US Cremonese 2026-02-22")
+        await context.bot.send_message(chat_id=TARGET_CHAT_ID, text="Formato inválido. Ej: /seguir Juventus vs Como 2026-02-21")
         return
 
     home, away = vs
-    key = _make_key(home, away, date_str)
+    key = _make_key(home, away, d)
+
     if key in TRACKED and not TRACKED[key].finished:
-        await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=f"Ya lo estoy siguiendo: {home} vs {away} ({date_str})")
+        await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=f"Ya lo sigo: {home} vs {away} ({d})")
         return
 
-    TRACKED[key] = TrackedMatch(home=home, away=away, match_date=date_str)
+    TRACKED[key] = TrackedMatch(home=home, away=away, match_date=d)
     save_state()
-
-    await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=f"✅ Añadido: {home} vs {away} ({date_str}). Actualizo cada {POLL_INTERVAL_SECONDS//60} min.")
+    await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=f"✅ Añadido: {home} vs {away} ({d}).")
 
 async def cmd_lista(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat and update.effective_chat.id != TARGET_CHAT_ID:
         return
-
     active = [tm for tm in TRACKED.values() if not tm.finished]
     if not active:
-        await context.bot.send_message(chat_id=TARGET_CHAT_ID, text="No hay partidos en seguimiento. Usa /seguir ...")
+        await context.bot.send_message(chat_id=TARGET_CHAT_ID, text="No hay partidos en seguimiento.")
         return
-
-    lines = ["📋 Partidos en seguimiento:"]
+    lines = ["📋 Seguimiento:"]
     for tm in active:
         lines.append(f"• {tm.home} vs {tm.away} ({tm.match_date})")
     await context.bot.send_message(chat_id=TARGET_CHAT_ID, text="\n".join(lines))
@@ -263,7 +288,6 @@ async def cmd_lista(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_borrar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat and update.effective_chat.id != TARGET_CHAT_ID:
         return
-
     text = " ".join(context.args).strip()
     if not text:
         await context.bot.send_message(chat_id=TARGET_CHAT_ID, text="Uso: /borrar Equipo A vs Equipo B [YYYY-MM-DD]")
@@ -272,26 +296,24 @@ async def cmd_borrar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     parts = text.split()
     maybe_date = _parse_date_arg(parts[-1]) if parts else None
     if maybe_date:
-        date_str = maybe_date
-        text_teams = " ".join(parts[:-1]).strip()
+        d = maybe_date
+        teams_text = " ".join(parts[:-1]).strip()
     else:
-        date_str = date.today().isoformat()
-        text_teams = text
+        d = date.today().isoformat()
+        teams_text = text
 
-    vs = _looks_like_vs(text_teams)
+    vs = _looks_like_vs(teams_text)
     if not vs:
-        await context.bot.send_message(chat_id=TARGET_CHAT_ID, text="Formato inválido. Ej: /borrar Lecce vs Inter Milan 2026-02-21")
+        await context.bot.send_message(chat_id=TARGET_CHAT_ID, text="Formato inválido.")
         return
-
     home, away = vs
-    key = _make_key(home, away, date_str)
+    key = _make_key(home, away, d)
     if key not in TRACKED:
         await context.bot.send_message(chat_id=TARGET_CHAT_ID, text="No lo encuentro en la lista.")
         return
-
     TRACKED.pop(key, None)
     save_state()
-    await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=f"🗑️ Borrado: {home} vs {away} ({date_str})")
+    await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=f"🗑️ Borrado: {home} vs {away} ({d})")
 
 async def cmd_limpiar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat and update.effective_chat.id != TARGET_CHAT_ID:
@@ -300,92 +322,105 @@ async def cmd_limpiar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     save_state()
     await context.bot.send_message(chat_id=TARGET_CHAT_ID, text="🧹 Lista limpiada.")
 
-# -----------------------
-# Polling job (cada X min)
-# -----------------------
+# --- Poll job ---
 async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    global LAST_HEAVY_POLL_TS
+
     active_keys = [k for k, tm in TRACKED.items() if not tm.finished]
     if not active_keys:
         return
 
-    # Pedimos eventos SOLO para los días que realmente necesitamos (hoy + los días de los partidos en seguimiento)
+    # ¿Tenemos alguno en juego? Si no, hacemos heavy poll solo cada IDLE_POLL_SECONDS
+    any_live_cached = any(is_live_status(TRACKED[k].last_status) for k in active_keys if TRACKED[k].last_status)
+    now = time.time()
+    if not any_live_cached and (now - LAST_HEAVY_POLL_TS) < IDLE_POLL_SECONDS:
+        return
+
     needed_dates = sorted({TRACKED[k].match_date for k in active_keys})
-    # Para evitar “quedarnos ciegos” por cambios horarios, también consultamos el día anterior y el siguiente si hay partidos "hoy"
-    # (best-effort)
-    expanded_dates = set(needed_dates)
-    try:
-        for d in needed_dates:
-            dd = datetime.strptime(d, "%Y-%m-%d").date()
-            expanded_dates.add((dd - timedelta(days=1)).isoformat())
-            expanded_dates.add((dd + timedelta(days=1)).isoformat())
-    except Exception:
-        expanded_dates = set(needed_dates)
 
-    # Descargamos eventos por día (1 request por día)
-    all_events_by_date: Dict[str, List[dict]] = {}
     async with httpx.AsyncClient(headers={"User-Agent": "telegram-resultados-bot"}) as client:
-        for d in sorted(expanded_dates):
+        # 1) Cargamos eventos por día (1 request por día)
+        events_by_date: Dict[str, List[dict]] = {}
+        for d in needed_dates:
             try:
-                evs = await fetch_events_day(client, d)
-                all_events_by_date[d] = evs
+                events_by_date[d] = await fetch_events_day(client, d)
             except Exception as e:
-                log.warning("TSDB eventsday failed for %s: %s", d, e)
-                all_events_by_date[d] = []
+                log.warning("eventsday failed for %s: %s", d, e)
+                events_by_date[d] = []
 
-    # Procesamos
-    for k in active_keys:
-        tm = TRACKED[k]
-        events = all_events_by_date.get(tm.match_date) or []
+        # 2) Procesamos cada partido seguido
+        any_live_now = False
+        for k in active_keys:
+            tm = TRACKED[k]
+            ev = find_event_for_match(events_by_date.get(tm.match_date, []), tm)
+            if not ev:
+                continue
 
-        ev = find_event_for_match(events, tm)
-        # si no aparece en su fecha exacta, probamos en +/-1 día (por timezone/fixture moved)
-        if not ev:
-            dd = datetime.strptime(tm.match_date, "%Y-%m-%d").date()
-            for alt in [(dd - timedelta(days=1)).isoformat(), (dd + timedelta(days=1)).isoformat()]:
-                ev = find_event_for_match(all_events_by_date.get(alt, []), tm)
-                if ev:
-                    # actualizamos la fecha para seguir bien
-                    tm.match_date = alt
-                    break
+            tm.id_event = str(ev.get("idEvent") or tm.id_event)
 
-        if not ev:
-            # No spameamos: solo guardamos que no lo vimos aún
-            log.info("No event found yet for: %s vs %s (%s)", tm.home, tm.away, tm.match_date)
-            continue
+            status = ev.get("strStatus")
+            hs = safe_int(ev.get("intHomeScore"))
+            as_ = safe_int(ev.get("intAwayScore"))
 
-        tm.id_event = str(ev.get("idEvent") or tm.id_event)
+            if is_live_status(status):
+                any_live_now = True
+                any_live_cached = True
 
-        status = ev.get("strStatus")
-        hs = safe_int(ev.get("intHomeScore"))
-        as_ = safe_int(ev.get("intAwayScore"))
+            # DESCANSO
+            if is_ht_status(status) and not is_ht_status(tm.last_status):
+                await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=f"⏸ DESCANSO: {scoreline(tm, status, hs, as_)}")
 
-        # Detecta cambios
-        changed_score = (hs is not None and as_ is not None) and (
-            tm.last_home_score != hs or tm.last_away_score != as_
-        )
-        changed_status = (status is not None) and (tm.last_status != status)
+            # GOL (cambio de marcador)
+            if (hs is not None and as_ is not None) and (tm.last_home_score != hs or tm.last_away_score != as_):
+                await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=f"⚽ GOL: {scoreline(tm, status, hs, as_)}")
 
-        # Mensajes (solo si hay info útil)
-        if changed_score:
-            text = "⚽ " + format_scoreline(tm, status, hs, as_)
-            await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=text)
+            # FINAL
+            if is_finished_status(status) and not tm.finished:
+                await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=f"✅ FINAL: {scoreline(tm, status, hs, as_)}")
+                tm.finished = True
 
-        # Si llega FT, avisamos final y dejamos de seguir
-        if is_finished_status(status):
-            final_text = "✅ FINAL: " + format_scoreline(tm, status, hs, as_)
-            await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=final_text)
-            tm.finished = True
+            # 3) Timeline (rojas / gol anulado / detalles)
+            # Solo si:
+            #  - el partido está en juego, o
+            #  - hubo cambio relevante (marcador/status)
+            relevant_change = (tm.last_status != status) or (
+                (hs is not None and as_ is not None) and (tm.last_home_score != hs or tm.last_away_score != as_)
+            )
+            if tm.id_event and (is_live_status(status) or relevant_change) and not tm.finished:
+                try:
+                    timeline = await fetch_timeline(client, tm.id_event)
+                    for item in timeline:
+                        key_tl = timeline_key(item)
+                        if not key_tl or key_tl in tm.seen_timeline_keys:
+                            continue
+                        tm.seen_timeline_keys.add(key_tl)
 
-        # actualiza last
-        tm.last_status = status
-        tm.last_home_score = hs
-        tm.last_away_score = as_
+                        kind, detail = classify_timeline(item)
+                        minute = item.get("intTime") or item.get("strTime") or ""
+                        minute_txt = f"{minute}' " if str(minute).strip() else ""
 
-    save_state()
+                        if kind == "red":
+                            await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=f"🟥 ROJA: {minute_txt}{tm.home} vs {tm.away} — {detail}")
+                        elif kind == "disallowed":
+                            await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=f"❌ GOL ANULADO: {minute_txt}{tm.home} vs {tm.away} — {detail}")
+                        elif kind == "goal":
+                            # Ojo: ya mandamos gol por cambio de marcador; esto añade el detalle (si quieres, se puede apagar)
+                            await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=f"⚽ EVENTO GOL: {minute_txt}{tm.home} vs {tm.away} — {detail}")
+                except Exception as e:
+                    log.warning("timeline failed for %s: %s", tm.id_event, e)
 
-# -----------------------
-# Main
-# -----------------------
+            tm.last_status = status
+            tm.last_home_score = hs
+            tm.last_away_score = as_
+
+        save_state()
+
+        # Si no hay ninguno en juego ahora, marcamos heavy poll timestamp (idle throttling)
+        if not any_live_now:
+            LAST_HEAVY_POLL_TS = time.time()
+        else:
+            LAST_HEAVY_POLL_TS = 0.0  # mientras haya live, no throttling
+
 def main() -> None:
     load_state()
 
@@ -397,11 +432,10 @@ def main() -> None:
     app.add_handler(CommandHandler("borrar", cmd_borrar))
     app.add_handler(CommandHandler("limpiar", cmd_limpiar))
 
-    # JobQueue: polling
-    app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL_SECONDS, first=10)
+    app.job_queue.run_repeating(poll_job, interval=TICK_SECONDS, first=10)
 
-    log.info("Bot started. Target chat id: %s | interval=%ss | tsdb_key=%s",
-             TARGET_CHAT_ID, POLL_INTERVAL_SECONDS, ("***" if SPORTSDB_KEY else ""))
+    log.info("Bot started. chat=%s tick=%ss idle=%ss key=%s",
+             TARGET_CHAT_ID, TICK_SECONDS, IDLE_POLL_SECONDS, "***")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
