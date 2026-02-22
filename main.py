@@ -27,16 +27,16 @@ TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0").strip())
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60").strip())
 STATE_FILE = os.getenv("STATE_FILE", "state.json").strip()
 
-# TheSportsDB (menos estable con key shared)
+# TheSportsDB
 SPORTSDB_KEY = os.getenv("SPORTSDB_KEY", "1").strip()
 SPORTSDB_ENABLED = bool(SPORTSDB_KEY)
 SPORTSDB_BASE = f"https://www.thesportsdb.com/api/v1/json/{SPORTSDB_KEY}" if SPORTSDB_ENABLED else ""
 
-# API-SPORTS (más estable)
+# API-SPORTS
 APISPORTS_KEY = os.getenv("APISPORTS_KEY", "").strip()
 APISPORTS_BASE = os.getenv("APISPORTS_BASE", "https://v3.football.api-sports.io").strip()
 
-# Preferencia: si existe API-SPORTS, úsala como principal y SportsDB como fallback.
+# Preferencia
 PREFER_APISPORTS = os.getenv("PREFER_APISPORTS", "1").strip() not in {"0", "false", "False", "NO", "no"}
 
 # Auto remove finished
@@ -48,9 +48,10 @@ MIN_SECONDS_BETWEEN_ALERTS = int(os.getenv("MIN_SECONDS_BETWEEN_ALERTS", "15").s
 INPLAY_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "PEN"}
 FINISHED_STATUSES = {"FT", "AET", "PEN"}
 
-# Ajustes anti-flakiness / matching
-DATE_WINDOW_DAYS = 4   # más permisivo (±4 días)
-MIN_MATCH_SCORE = 22   # umbral más tolerante
+# Ventana de fechas
+DATE_WINDOW_DAYS = 4
+
+# Retries/timeout
 MAX_HTTP_RETRIES = 2
 REQUEST_TIMEOUT = 20.0
 
@@ -71,8 +72,17 @@ SPORTSDB_LEAGUE_IDS = [
     4344,  # Portuguese Primeira Liga
 ]
 TEAM_INDEX_TTL_HOURS = int(os.getenv("TEAM_INDEX_TTL_HOURS", "168").strip())  # 7 días
-USE_SPORTSDB_LIVE_FIRST = os.getenv("USE_SPORTSDB_LIVE_FIRST", "1").strip() not in {"0","false","False","NO","no"}
 
+# live-first (se mantiene, pero sin sesgos: solo entra si pasa hard-gate fuerte)
+USE_SPORTSDB_LIVE_FIRST = os.getenv("USE_SPORTSDB_LIVE_FIRST", "1").strip() not in {"0", "false", "False", "NO", "no"}
+
+# =========================
+# MATCHING POLICY (NUEVO)
+# =========================
+# Score por equipo 0..100
+MIN_SIDE_SCORE = int(os.getenv("MIN_SIDE_SCORE", "58").strip())     # cada lado debe pasar esto
+MIN_PAIR_SCORE = int(os.getenv("MIN_PAIR_SCORE", "132").strip())   # suma de los 2 lados (aprox)
+# Nota: con nombres “cortos/raros” puedes bajar MIN_SIDE_SCORE a 55
 
 # =========================
 # HELPERS
@@ -95,17 +105,15 @@ def _ascii_lower(s: str) -> str:
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     return s
 
-# stopwords / ruido típico en nombres de equipos
 _STOPWORDS = {
     "fc","cf","sc","ac","cd","ud","afc","cfc",
     "club","de","la","el","the","and","y",
     "sporting","sports","football","futbol","fútbol",
-    "team","clubdeportivo","clubde","clubdeportivo",
+    "team","clubdeportivo","clubde",
     "sv","bv","vv","v.v.","v.v","v","fk","sk",
     "ss","as","ks","nk","rc","real",
 }
 
-# alias rápidos (opcionales) para casos comunes
 _ALIAS = {
     "barca": "barcelona",
     "fcb": "barcelona",
@@ -124,10 +132,8 @@ def normalize_team(s: str) -> str:
     s = s.replace("&", " ")
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-
     if s in _ALIAS:
         s = _ALIAS[s]
-
     parts = []
     for p in s.split():
         if p in _STOPWORDS:
@@ -156,7 +162,6 @@ def string_similarity(a: str, b: str) -> float:
 
 def parse_teams(text: str) -> Tuple[str, str]:
     t = re.sub(r"\s+", " ", text.strip())
-
     if re.search(r"\s+vs\s+", t, flags=re.IGNORECASE):
         a, b = re.split(r"\s+vs\s+", t, flags=re.IGNORECASE, maxsplit=1)
     elif re.search(r"\s+v\s+", t, flags=re.IGNORECASE):
@@ -167,7 +172,6 @@ def parse_teams(text: str) -> Tuple[str, str]:
         a, b = t.split(" @ ", 1)
     else:
         raise ValueError("Formato inválido. Usa: /seguir Equipo1 vs Equipo2 [YYYY-MM-DD] | pick=...")
-
     return a.strip(), b.strip()
 
 def parse_optional_date(parts: List[str]) -> Optional[date]:
@@ -277,6 +281,55 @@ def is_state_fresh(saved_iso: str, ttl_hours: int) -> bool:
         return False
     return (_now_utc() - dt) <= timedelta(hours=ttl_hours)
 
+# =========================
+# MATCHING (NUEVO: hard gate + scores explicables)
+# =========================
+def team_similarity_score(event_name: str, query_name: str) -> int:
+    """
+    Devuelve 0..100 (aprox). Combina tokens + string + exactitud normalizada.
+    """
+    evn = normalize_team(event_name)
+    qn = normalize_team(query_name)
+    if not evn or not qn:
+        return 0
+
+    ts = token_similarity(event_name, query_name)          # 0..1
+    ss = string_similarity(event_name, query_name)         # 0..1
+    exact = 1.0 if evn == qn else 0.0
+
+    # Ponderación robusta
+    raw = 0.55 * ts + 0.35 * ss + 0.10 * exact
+    return int(round(100 * raw))
+
+def best_assignment_scores(ev_home: str, ev_away: str, q_home: str, q_away: str) -> Tuple[int, int, str]:
+    """
+    Devuelve (home_side_score, away_side_score, mode)
+    mode: "STRAIGHT" si (ev_home~q_home y ev_away~q_away), "SWAP" si al revés.
+    """
+    s_hh = team_similarity_score(ev_home, q_home)
+    s_aa = team_similarity_score(ev_away, q_away)
+    s_ha = team_similarity_score(ev_home, q_away)
+    s_ah = team_similarity_score(ev_away, q_home)
+
+    straight_min = min(s_hh, s_aa)
+    swap_min = min(s_ha, s_ah)
+
+    if swap_min > straight_min:
+        return s_ha, s_ah, "SWAP"
+    return s_hh, s_aa, "STRAIGHT"
+
+def passes_hard_gate(ev_home: str, ev_away: str, q_home: str, q_away: str) -> Tuple[bool, int, int, int, str, str]:
+    """
+    (ok, pair_score, s1, s2, mode, reason_if_fail)
+    """
+    s1, s2, mode = best_assignment_scores(ev_home, ev_away, q_home, q_away)
+    pair = s1 + s2
+
+    if s1 < MIN_SIDE_SCORE or s2 < MIN_SIDE_SCORE:
+        return (False, pair, s1, s2, mode, f"rechazado: lado débil (s1={s1}, s2={s2}, min={MIN_SIDE_SCORE})")
+    if pair < MIN_PAIR_SCORE:
+        return (False, pair, s1, s2, mode, f"rechazado: suma baja (pair={pair}, min={MIN_PAIR_SCORE})")
+    return (True, pair, s1, s2, mode, "aceptado")
 
 # =========================
 # PICK parsing (multi-pick)
@@ -316,7 +369,6 @@ def fmt_pick(pick: str) -> str:
         return f"\nPICKS: {pick}"
     return f"\nPICK: {pick}"
 
-
 # =========================
 # STATE
 # =========================
@@ -346,7 +398,6 @@ class TrackedMatch:
     consecutive_failures: int = 0
 
     last_alert_utc: str = ""
-
 
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_FILE):
@@ -434,7 +485,6 @@ def stats_inc(state: Dict[str, Any], key: str, n: int = 1) -> None:
     st[key] = int(st.get(key, 0)) + n
     state["stats"] = st
 
-
 # =========================
 # HTTP (cliente global + retries)
 # =========================
@@ -451,16 +501,21 @@ def _get_client() -> httpx.AsyncClient:
     return _client
 
 async def http_get_json(url: str, params: Optional[dict] = None, headers: Optional[dict] = None) -> dict:
-    last_exc = None
-    for _ in range(MAX_HTTP_RETRIES + 1):
+    last_exc: Optional[Exception] = None
+    for attempt in range(MAX_HTTP_RETRIES + 1):
         try:
             r = await _get_client().get(url, params=params, headers=headers)
+            if r.status_code >= 400:
+                # Log compacto pero útil
+                body_snip = (r.text or "")[:180].replace("\n", " ")
+                log.info("HTTP %s -> %s body=%s", url, r.status_code, body_snip)
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last_exc = e
-            await asyncio.sleep(0.2)
-    raise last_exc
+            if attempt < MAX_HTTP_RETRIES:
+                await asyncio.sleep(0.25)
+    raise last_exc  # type: ignore
 
 def is_sportsdb_unusable_error(exc: Exception) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
@@ -469,7 +524,6 @@ def is_sportsdb_unusable_error(exc: Exception) -> bool:
     if isinstance(exc, httpx.RequestError):
         return True
     return False
-
 
 # =========================
 # API: TheSportsDB
@@ -544,29 +598,11 @@ def minute_from_sportsdb(ev: dict) -> str:
         return ""
     return mt
 
-def event_match_score_sportsdb(ev: dict, home_q: str, away_q: str) -> int:
+def sportsdb_candidate_score(ev: dict, home_q: str, away_q: str) -> Tuple[bool, int, int, int, str, str]:
     h, a = teams_from_sportsdb(ev)
-    q_set = {normalize_team(home_q), normalize_team(away_q)}
-    e_set = {normalize_team(h), normalize_team(a)}
+    return passes_hard_gate(h, a, home_q, away_q)
 
-    score = 0
-    if e_set == q_set:
-        score += 150
-    else:
-        score += int(85 * max(token_similarity(h, home_q), token_similarity(h, away_q)))
-        score += int(85 * max(token_similarity(a, home_q), token_similarity(a, away_q)))
-        score += int(70 * max(string_similarity(h, home_q), string_similarity(h, away_q)))
-        score += int(70 * max(string_similarity(a, home_q), string_similarity(a, away_q)))
-
-    if status_bucket(status_from_sportsdb(ev)) == "INPLAY":
-        score += 25
-
-    hs, as_ = score_from_sportsdb(ev)
-    if hs is not None or as_ is not None:
-        score += 5
-    return score
-
-# ---- Team index + Live-first (SportsDB) ----
+# ---- Team index ----
 async def fetch_all_teams_in_league_sportsdb(league_id: int) -> List[dict]:
     if not SPORTSDB_ENABLED:
         return []
@@ -604,6 +640,7 @@ async def ensure_team_index_sportsdb(state: Dict[str, Any]) -> None:
 
     state["team_index"] = team_index
     state["team_index_meta"] = {"saved_utc": now_iso(), "league_ids": SPORTSDB_LEAGUE_IDS}
+    log.info("Team index rebuilt: keys=%s", len(team_index))
 
 def best_team_from_index(state: Dict[str, Any], query_name: str) -> Optional[Tuple[str, str]]:
     idx = state.get("team_index") or {}
@@ -642,23 +679,11 @@ async def fetch_livescore_sportsdb() -> List[dict]:
     js = await http_get_json(url, params={"s": "Soccer"})
     return js.get("events") or []
 
-def event_score_by_team_ids(ev: dict, home_id: Optional[str], away_id: Optional[str], home_q: str, away_q: str) -> int:
-    score = 0
-    ev_hid = str(ev.get("idHomeTeam") or "").strip()
-    ev_aid = str(ev.get("idAwayTeam") or "").strip()
-
-    if home_id and away_id:
-        if {ev_hid, ev_aid} == {home_id, away_id}:
-            return 1000
-        if home_id in {ev_hid, ev_aid}:
-            score += 200
-        if away_id in {ev_hid, ev_aid}:
-            score += 200
-
-    score += event_match_score_sportsdb(ev, home_q, away_q)
-    return score
-
 async def find_best_live_event_sportsdb(state: Dict[str, Any], home: str, away: str) -> Optional[dict]:
+    """
+    live-first sin sesgo: solo acepta si pasa hard-gate fuerte.
+    Si tenemos IDs de ambos equipos y coincide el set de IDs -> preferencia máxima.
+    """
     await ensure_team_index_sportsdb(state)
     home_hit = best_team_from_index(state, home)
     away_hit = best_team_from_index(state, away)
@@ -666,89 +691,155 @@ async def find_best_live_event_sportsdb(state: Dict[str, Any], home: str, away: 
     away_id = away_hit[0] if away_hit else None
 
     events = await fetch_livescore_sportsdb()
-    best_ev = None
-    best_sc = -1
+
+    scored: List[Tuple[int, dict, str]] = []
     for ev in events:
-        sc = event_score_by_team_ids(ev, home_id, away_id, home, away)
-        if sc > best_sc:
-            best_sc, best_ev = sc, ev
+        ev_hid = str(ev.get("idHomeTeam") or "").strip()
+        ev_aid = str(ev.get("idAwayTeam") or "").strip()
+        ev_home, ev_away = teams_from_sportsdb(ev)
 
-    if home_id and away_id:
-        if best_ev and best_sc >= 900:
-            return best_ev
-        return None
+        ok, pair, s1, s2, mode, reason = passes_hard_gate(ev_home, ev_away, home, away)
 
-    if best_ev and best_sc >= max(MIN_MATCH_SCORE, 60):
+        # si tenemos ambos IDs, exigimos match real por IDs (para evitar “en vivo gana”)
+        if home_id and away_id:
+            if {ev_hid, ev_aid} != {home_id, away_id}:
+                continue
+            if ok:
+                # boost determinista solo por IDs correctos (no por estado)
+                pair += 40
+        else:
+            if not ok:
+                continue
+
+        scored.append((pair, ev, f"{reason} mode={mode} s1={s1} s2={s2}"))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if scored:
+        best_pair, best_ev, why = scored[0]
+        top3 = scored[:3]
+        try:
+            log.info(
+                "SportsDB live-first candidates for '%s vs %s': %s",
+                home, away,
+                "; ".join([f"{teams_from_sportsdb(e)[0]} vs {teams_from_sportsdb(e)[1]} pair={p}" for p, e, _ in top3])
+            )
+            log.info("SportsDB live-first selected pair=%s why=%s", best_pair, why)
+        except Exception:
+            pass
         return best_ev
     return None
 
-# ---- end live-first ----
-
-async def find_best_event_sportsdb(home: str, away: str, target_date: Optional[date]) -> Optional[dict]:
+async def find_best_event_sportsdb(state: Dict[str, Any], home: str, away: str, target_date: Optional[date]) -> Optional[dict]:
+    """
+    NUEVO orden:
+      1) Resolver por team IDs (index -> searchteams) y usar eventsnext/eventslast (espacio pequeño)
+      2) Solo si falla, usar eventsday como último recurso
+    """
     if not SPORTSDB_ENABLED:
         return None
 
     td = target_date or _now_utc().date()
-    candidates: List[dict] = []
+    valid_dates = set((td + timedelta(days=dlt)).strftime("%Y-%m-%d") for dlt in range(-DATE_WINDOW_DAYS, DATE_WINDOW_DAYS + 1))
 
+    await ensure_team_index_sportsdb(state)
+
+    # 1) IDs por índice o searchteams
+    home_hit = best_team_from_index(state, home)
+    away_hit = best_team_from_index(state, away)
+
+    home_id = home_hit[0] if home_hit else None
+    away_id = away_hit[0] if away_hit else None
+
+    if not home_id:
+        try:
+            h = await search_team_id_sportsdb(home)
+            if h:
+                home_id = h[0]
+        except Exception:
+            pass
+    if not away_id:
+        try:
+            a = await search_team_id_sportsdb(away)
+            if a:
+                away_id = a[0]
+        except Exception:
+            pass
+
+    # 1A) Eventos del equipo (ventana pequeña)
+    candidates: List[dict] = []
+    if home_id:
+        candidates.extend(await fetch_team_events_window(home_id))
+    if away_id:
+        candidates.extend(await fetch_team_events_window(away_id))
+
+    # dedupe por idEvent
+    seen = set()
+    cand2 = []
+    for ev in candidates:
+        eid = str(ev.get("idEvent") or "").strip()
+        if not eid or eid in seen:
+            continue
+        seen.add(eid)
+        cand2.append(ev)
+    candidates = cand2
+
+    # filtro por fecha (si existe dateEvent)
+    c_by_date = [ev for ev in candidates if (ev.get("dateEvent") or "").strip() in valid_dates]
+    candidates = c_by_date or candidates
+
+    scored: List[Tuple[int, dict, str]] = []
+    for ev in candidates:
+        ev_home, ev_away = teams_from_sportsdb(ev)
+        ok, pair, s1, s2, mode, reason = passes_hard_gate(ev_home, ev_away, home, away)
+        if not ok:
+            continue
+        scored.append((pair, ev, f"{reason} mode={mode} s1={s1} s2={s2}"))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if scored:
+        top3 = scored[:3]
+        log.info(
+            "SportsDB team-events candidates for '%s vs %s': %s",
+            home, away,
+            "; ".join([f"{teams_from_sportsdb(e)[0]} vs {teams_from_sportsdb(e)[1]} pair={p}" for p, e, _ in top3])
+        )
+        best_pair, best_ev, why = scored[0]
+        log.info("SportsDB team-events selected pair=%s why=%s", best_pair, why)
+        return best_ev
+
+    # 2) Último recurso: eventsday (pero con hard gate)
+    day_candidates: List[dict] = []
     for dlt in range(-DATE_WINDOW_DAYS, DATE_WINDOW_DAYS + 1):
         d = td + timedelta(days=dlt)
         try:
-            candidates.extend(await fetch_events_for_day(d))
+            day_candidates.extend(await fetch_events_for_day(d))
         except Exception as e:
             if is_sportsdb_unusable_error(e):
                 log.info("SportsDB eventsday no usable (%s): %s", d, repr(e))
             else:
                 log.exception("Error pidiendo eventsday %s", d)
 
-    best_ev = None
-    best_sc = -1
-    for ev in candidates:
-        sc = event_match_score_sportsdb(ev, home, away)
-        if sc > best_sc:
-            best_sc, best_ev = sc, ev
+    scored2: List[Tuple[int, dict, str]] = []
+    for ev in day_candidates:
+        ev_home, ev_away = teams_from_sportsdb(ev)
+        ok, pair, s1, s2, mode, reason = passes_hard_gate(ev_home, ev_away, home, away)
+        if not ok:
+            continue
+        scored2.append((pair, ev, f"{reason} mode={mode} s1={s1} s2={s2}"))
 
-    if best_ev and best_sc >= MIN_MATCH_SCORE:
+    scored2.sort(key=lambda x: x[0], reverse=True)
+    if scored2:
+        top3 = scored2[:3]
+        log.info(
+            "SportsDB eventsday candidates for '%s vs %s': %s",
+            home, away,
+            "; ".join([f"{teams_from_sportsdb(e)[0]} vs {teams_from_sportsdb(e)[1]} pair={p}" for p, e, _ in top3])
+        )
+        best_pair, best_ev, why = scored2[0]
+        log.info("SportsDB eventsday selected pair=%s why=%s", best_pair, why)
         return best_ev
 
-    try:
-        home_team = await search_team_id_sportsdb(home)
-        if home_team:
-            home_id, _ = home_team
-            evs = await fetch_team_events_window(home_id)
-            dd = set((td + timedelta(days=dlt)).strftime("%Y-%m-%d") for dlt in range(-DATE_WINDOW_DAYS, DATE_WINDOW_DAYS + 1))
-            evs2 = [ev for ev in evs if (ev.get("dateEvent") or "").strip() in dd] or evs
-
-            best_ev = None
-            best_sc = -1
-            for ev in evs2:
-                sc = event_match_score_sportsdb(ev, home, away)
-                if sc > best_sc:
-                    best_sc, best_ev = sc, ev
-            if best_ev and best_sc >= MIN_MATCH_SCORE:
-                return best_ev
-    except Exception as e:
-        log.info("Fallback por equipo (SportsDB home) falló: %s", repr(e))
-
-    try:
-        away_team = await search_team_id_sportsdb(away)
-        if away_team:
-            away_id, _ = away_team
-            evs = await fetch_team_events_window(away_id)
-            dd = set((td + timedelta(days=dlt)).strftime("%Y-%m-%d") for dlt in range(-DATE_WINDOW_DAYS, DATE_WINDOW_DAYS + 1))
-            evs2 = [ev for ev in evs if (ev.get("dateEvent") or "").strip() in dd] or evs
-
-            best_ev = None
-            best_sc = -1
-            for ev in evs2:
-                sc = event_match_score_sportsdb(ev, home, away)
-                if sc > best_sc:
-                    best_sc, best_ev = sc, ev
-            if best_ev and best_sc >= MIN_MATCH_SCORE:
-                return best_ev
-    except Exception as e:
-        log.info("Fallback por equipo (SportsDB away) falló: %s", repr(e))
-
+    log.info("SportsDB: no match after hard gate for '%s vs %s'", home, away)
     return None
 
 async def fetch_event_by_id_sportsdb(event_id: str) -> Optional[dict]:
@@ -788,7 +879,6 @@ def describe_timeline(item: dict) -> Optional[Tuple[str, str, str]]:
     if "disallow" in ttype_low or "annul" in ttype_low or "cancel" in ttype_low:
         return ("DISALLOWED_GOAL", minute, team)
     return None
-
 
 # =========================
 # API: API-SPORTS
@@ -872,27 +962,9 @@ async def apisports_team_id(state: Dict[str, Any], team_name: str) -> Optional[i
     state["team_cache"] = cache
     return best_id
 
-def match_score_apisports(fx: dict, home_q: str, away_q: str) -> int:
+def apisports_candidate_score(fx: dict, home_q: str, away_q: str) -> Tuple[bool, int, int, int, str, str]:
     h, a = teams_from_apisports(fx)
-    q_set = {normalize_team(home_q), normalize_team(away_q)}
-    e_set = {normalize_team(h), normalize_team(a)}
-
-    sc = 0
-    if e_set == q_set:
-        sc += 150
-    else:
-        sc += int(85 * max(token_similarity(h, home_q), token_similarity(h, away_q)))
-        sc += int(85 * max(token_similarity(a, home_q), token_similarity(a, away_q)))
-        sc += int(70 * max(string_similarity(h, home_q), string_similarity(h, away_q)))
-        sc += int(70 * max(string_similarity(a, home_q), string_similarity(a, away_q)))
-
-    if status_bucket(status_from_apisports(fx)) == "INPLAY":
-        sc += 25
-
-    hs, as_ = score_from_apisports(fx)
-    if hs is not None or as_ is not None:
-        sc += 5
-    return sc
+    return passes_hard_gate(h, a, home_q, away_q)
 
 async def find_best_event_apisports(state: Dict[str, Any], home: str, away: str, target_date: Optional[date]) -> Optional[dict]:
     if not APISPORTS_KEY:
@@ -906,12 +978,10 @@ async def find_best_event_apisports(state: Dict[str, Any], home: str, away: str,
         home2 = normalize_team(home)
         if home2 and home2 != home:
             home_id = await apisports_team_id(state, home2)
-
     if home_id is None:
         return None
 
-    best = None
-    best_sc = -1
+    scored: List[Tuple[int, dict, str]] = []
 
     for dlt in range(-DATE_WINDOW_DAYS, DATE_WINDOW_DAYS + 1):
         d = td + timedelta(days=dlt)
@@ -928,32 +998,25 @@ async def find_best_event_apisports(state: Dict[str, Any], home: str, away: str,
                 ta = ((fx.get("teams") or {}).get("away") or {}).get("id")
                 if away_id not in {th, ta}:
                     continue
-            sc = match_score_apisports(fx, home, away)
-            if sc > best_sc:
-                best_sc = sc
-                best = fx
 
-    if best and best_sc >= MIN_MATCH_SCORE:
-        return best
+            ok, pair, s1, s2, mode, reason = apisports_candidate_score(fx, home, away)
+            if not ok:
+                continue
+            scored.append((pair, fx, f"{reason} mode={mode} s1={s1} s2={s2}"))
 
-    if away_id is None:
-        for dlt in range(-DATE_WINDOW_DAYS, DATE_WINDOW_DAYS + 1):
-            d = td + timedelta(days=dlt)
-            url = f"{APISPORTS_BASE}/fixtures"
-            js = await http_get_json(
-                url,
-                params={"date": d.strftime("%Y-%m-%d"), "team": home_id},
-                headers=apisports_headers(),
-            )
-            resp = js.get("response") or []
-            for fx in resp:
-                sc = match_score_apisports(fx, home, away)
-                if sc > best_sc:
-                    best_sc = sc
-                    best = fx
-        if best and best_sc >= MIN_MATCH_SCORE:
-            return best
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if scored:
+        top3 = scored[:3]
+        log.info(
+            "API-SPORTS candidates for '%s vs %s': %s",
+            home, away,
+            "; ".join([f"{teams_from_apisports(f)[0]} vs {teams_from_apisports(f)[1]} pair={p}" for p, f, _ in top3])
+        )
+        best_pair, best_fx, why = scored[0]
+        log.info("API-SPORTS selected pair=%s why=%s", best_pair, why)
+        return best_fx
 
+    log.info("API-SPORTS: no match after hard gate for '%s vs %s'", home, away)
     return None
 
 async def fetch_fixture_by_id_apisports(fixture_id: str) -> Optional[dict]:
@@ -963,7 +1026,6 @@ async def fetch_fixture_by_id_apisports(fixture_id: str) -> Optional[dict]:
     js = await http_get_json(url, params={"id": fixture_id}, headers=apisports_headers())
     resp = js.get("response") or []
     return resp[0] if resp else None
-
 
 # =========================
 # TELEGRAM OUTPUT
@@ -978,7 +1040,6 @@ def fmt_score(home: str, away: str, hs: Optional[int], aas: Optional[int]) -> st
     if hs is None or aas is None:
         return f"{home} vs {away}"
     return f"{home} {hs}–{aas} {away}"
-
 
 # =========================
 # MIGRATION: SportsDB -> API-SPORTS
@@ -1019,7 +1080,6 @@ async def migrate_match_to_apisports(state: Dict[str, Any], m: TrackedMatch) -> 
 
     return True
 
-
 # =========================
 # RESOLVER
 # =========================
@@ -1046,7 +1106,7 @@ async def resolve_match(
         except Exception:
             pass
 
-    # 0) Live-first SportsDB (1 request) si está ON
+    # 0) Live-first SportsDB (1 request) si está ON, pero SOLO si pasa hard gate
     if SPORTSDB_ENABLED and USE_SPORTSDB_LIVE_FIRST:
         try:
             live_ev = await find_best_live_event_sportsdb(state, home, away)
@@ -1083,7 +1143,7 @@ async def resolve_match(
             if not SPORTSDB_ENABLED:
                 continue
             try:
-                ev = await find_best_event_sportsdb(home, away, target_date)
+                ev = await find_best_event_sportsdb(state, home, away, target_date)
                 if ev:
                     mid = str(ev.get("idEvent") or "").strip()
                     if mid and await verify_event_usable_sportsdb(mid):
@@ -1096,8 +1156,8 @@ async def resolve_match(
         qcache[qkey] = {"provider": provider, "match_id": match_id, "saved_utc": now_iso()}
         state["query_cache"] = qcache
 
+    log.info("Resolver result for '%s vs %s' -> provider=%s id=%s", home, away, provider, match_id)
     return provider, match_id, ev, fx
-
 
 # =========================
 # COMMANDS
@@ -1118,6 +1178,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Prefer API-SPORTS: {'YES' if (PREFER_APISPORTS and APISPORTS_KEY) else 'NO'}\n"
         f"SportsDB live-first: {'YES' if (SPORTSDB_ENABLED and USE_SPORTSDB_LIVE_FIRST) else 'NO'}\n"
         f"Team index TTL: {TEAM_INDEX_TTL_HOURS}h\n"
+        f"Hard gate: MIN_SIDE_SCORE={MIN_SIDE_SCORE}, MIN_PAIR_SCORE={MIN_PAIR_SCORE}\n"
         f"Auto remove finished: {'YES' if AUTO_REMOVE_FINISHED else 'NO'}"
     )
     await update.message.reply_text(help_text)
@@ -1126,6 +1187,18 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     state = load_state()
     tracked = get_tracked(state)
     st = state.get("stats", {}) or {}
+
+    # NUEVO: intentar construir índice aquí (para que no salga 0 eternamente)
+    if SPORTSDB_ENABLED:
+        try:
+            before_n = len(state.get("team_index") or {})
+            await ensure_team_index_sportsdb(state)
+            after_n = len(state.get("team_index") or {})
+            if after_n != before_n:
+                save_state(state)
+        except Exception as e:
+            log.info("ensure_team_index_sportsdb en /estado falló: %s", repr(e))
+
     cleanup_query_cache(state)
     save_state(state)
 
@@ -1138,6 +1211,7 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"- Prefer API-SPORTS: {'YES' if (PREFER_APISPORTS and APISPORTS_KEY) else 'NO'}",
         f"- SportsDB live-first: {'YES' if (SPORTSDB_ENABLED and USE_SPORTSDB_LIVE_FIRST) else 'NO'}",
         f"- Team index keys: {len(ti)} (TTL {TEAM_INDEX_TTL_HOURS}h)",
+        f"- Hard gate: MIN_SIDE_SCORE={MIN_SIDE_SCORE}, MIN_PAIR_SCORE={MIN_PAIR_SCORE}",
         f"- Auto remove finished: {'YES' if AUTO_REMOVE_FINISHED else 'NO'}",
         f"- Seguidos: {len(tracked)}",
         f"- Query cache: {len((state.get('query_cache') or {}))} (TTL {QUERY_CACHE_TTL_HOURS}h)",
@@ -1293,7 +1367,6 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
 
     state = load_state()
 
-    # (muy recomendado) índice listo al usar /seguir
     if SPORTSDB_ENABLED:
         try:
             before_n = len(state.get("team_index") or {})
@@ -1333,7 +1406,7 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
     provider, match_id, ev, fx = await resolve_match(state, home, away, target_date)
     if not provider or not match_id:
         save_state(state)
-        msg = f"❌ {home} vs {away}{fmt_pick_inline(pick)} -> no encontrado (±{DATE_WINDOW_DAYS}d)"
+        msg = f"❌ {home} vs {away}{fmt_pick_inline(pick)} -> no encontrado (hard gate ON, ±{DATE_WINDOW_DAYS}d)"
         if not silent:
             await update.message.reply_text(msg)
         return ("fail", msg)
@@ -1353,6 +1426,7 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
             log.info("API-SPORTS lookup error: %s", repr(e))
             fx = None
 
+    # Si el lookup falla, invalidamos cache y reintentamos fallback
     if provider == "sportsdb" and not ev:
         qc = state.get("query_cache", {}) or {}
         qc.pop(qkey, None)
@@ -1376,7 +1450,7 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
         qc.pop(qkey, None)
         state["query_cache"] = qc
         if SPORTSDB_ENABLED:
-            ev2 = await find_best_event_sportsdb(home, away, target_date)
+            ev2 = await find_best_event_sportsdb(state, home, away, target_date)
             if ev2:
                 mid2 = str(ev2.get("idEvent") or "").strip()
                 if mid2 and await verify_event_usable_sportsdb(mid2):
@@ -1469,7 +1543,6 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
     if not silent:
         await update.message.reply_text(msg)
     return ("ok", msg)
-
 
 # =========================
 # POLLING JOB
@@ -1658,7 +1731,6 @@ async def poll_once(app: Application) -> None:
 async def job_poll(context: ContextTypes.DEFAULT_TYPE) -> None:
     await poll_once(context.application)
 
-
 # =========================
 # MAIN
 # =========================
@@ -1683,12 +1755,14 @@ def main() -> None:
     app = build_app()
     log.info("Bot started. Target chat id: %s", TARGET_CHAT_ID)
     log.info(
-        "SPORTSDB=%s | APISPORTS=%s | PREFER_APISPORTS=%s | LIVE_FIRST=%s | AUTO_REMOVE_FINISHED=%s",
+        "SPORTSDB=%s | APISPORTS=%s | PREFER_APISPORTS=%s | LIVE_FIRST=%s | AUTO_REMOVE_FINISHED=%s | HARD_GATE(min_side=%s min_pair=%s)",
         "ON" if SPORTSDB_ENABLED else "OFF",
         "ON" if APISPORTS_KEY else "OFF",
         "YES" if (PREFER_APISPORTS and APISPORTS_KEY) else "NO",
         "YES" if (SPORTSDB_ENABLED and USE_SPORTSDB_LIVE_FIRST) else "NO",
         "YES" if AUTO_REMOVE_FINISHED else "NO",
+        MIN_SIDE_SCORE,
+        MIN_PAIR_SCORE,
     )
     app.run_polling(drop_pending_updates=True)
 
