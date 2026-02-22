@@ -77,12 +77,10 @@ TEAM_INDEX_TTL_HOURS = int(os.getenv("TEAM_INDEX_TTL_HOURS", "168").strip())  # 
 USE_SPORTSDB_LIVE_FIRST = os.getenv("USE_SPORTSDB_LIVE_FIRST", "1").strip() not in {"0", "false", "False", "NO", "no"}
 
 # =========================
-# MATCHING POLICY (NUEVO)
+# MATCHING POLICY
 # =========================
-# Score por equipo 0..100
-MIN_SIDE_SCORE = int(os.getenv("MIN_SIDE_SCORE", "58").strip())     # cada lado debe pasar esto
-MIN_PAIR_SCORE = int(os.getenv("MIN_PAIR_SCORE", "132").strip())   # suma de los 2 lados (aprox)
-# Nota: con nombres “cortos/raros” puedes bajar MIN_SIDE_SCORE a 55
+MIN_SIDE_SCORE = int(os.getenv("MIN_SIDE_SCORE", "58").strip())
+MIN_PAIR_SCORE = int(os.getenv("MIN_PAIR_SCORE", "132").strip())
 
 # =========================
 # HELPERS
@@ -247,8 +245,9 @@ def cleanup_query_cache(state: Dict[str, Any]) -> None:
         qc.pop(k, None)
     state["query_cache"] = qc
 
+# ✅ COMANDO PINCHABLE SIN FECHA Y CON /dejardeseguir
 def unfollow_cmd_line(m: "TrackedMatch") -> str:
-    return f"/borrar {m.home} vs {m.away} {m.date_str}"
+    return f"/dejardeseguir {m.home} vs {m.away}"
 
 def minute_prefix(minute: str) -> str:
     minute = (minute or "").strip()
@@ -282,30 +281,22 @@ def is_state_fresh(saved_iso: str, ttl_hours: int) -> bool:
     return (_now_utc() - dt) <= timedelta(hours=ttl_hours)
 
 # =========================
-# MATCHING (NUEVO: hard gate + scores explicables)
+# MATCHING
 # =========================
 def team_similarity_score(event_name: str, query_name: str) -> int:
-    """
-    Devuelve 0..100 (aprox). Combina tokens + string + exactitud normalizada.
-    """
     evn = normalize_team(event_name)
     qn = normalize_team(query_name)
     if not evn or not qn:
         return 0
 
-    ts = token_similarity(event_name, query_name)          # 0..1
-    ss = string_similarity(event_name, query_name)         # 0..1
+    ts = token_similarity(event_name, query_name)
+    ss = string_similarity(event_name, query_name)
     exact = 1.0 if evn == qn else 0.0
 
-    # Ponderación robusta
     raw = 0.55 * ts + 0.35 * ss + 0.10 * exact
     return int(round(100 * raw))
 
 def best_assignment_scores(ev_home: str, ev_away: str, q_home: str, q_away: str) -> Tuple[int, int, str]:
-    """
-    Devuelve (home_side_score, away_side_score, mode)
-    mode: "STRAIGHT" si (ev_home~q_home y ev_away~q_away), "SWAP" si al revés.
-    """
     s_hh = team_similarity_score(ev_home, q_home)
     s_aa = team_similarity_score(ev_away, q_away)
     s_ha = team_similarity_score(ev_home, q_away)
@@ -319,9 +310,6 @@ def best_assignment_scores(ev_home: str, ev_away: str, q_home: str, q_away: str)
     return s_hh, s_aa, "STRAIGHT"
 
 def passes_hard_gate(ev_home: str, ev_away: str, q_home: str, q_away: str) -> Tuple[bool, int, int, int, str, str]:
-    """
-    (ok, pair_score, s1, s2, mode, reason_if_fail)
-    """
     s1, s2, mode = best_assignment_scores(ev_home, ev_away, q_home, q_away)
     pair = s1 + s2
 
@@ -378,7 +366,7 @@ class TrackedMatch:
     away: str
     date_str: str
     match_id: str
-    provider: str = "sportsdb"   # "sportsdb" | "apisports"
+    provider: str = "sportsdb"
     pick: str = ""
 
     league: str = ""
@@ -486,7 +474,7 @@ def stats_inc(state: Dict[str, Any], key: str, n: int = 1) -> None:
     state["stats"] = st
 
 # =========================
-# HTTP (cliente global + retries)
+# HTTP
 # =========================
 class UpstreamBlocked(Exception):
     pass
@@ -506,7 +494,6 @@ async def http_get_json(url: str, params: Optional[dict] = None, headers: Option
         try:
             r = await _get_client().get(url, params=params, headers=headers)
             if r.status_code >= 400:
-                # Log compacto pero útil
                 body_snip = (r.text or "")[:180].replace("\n", " ")
                 log.info("HTTP %s -> %s body=%s", url, r.status_code, body_snip)
             r.raise_for_status()
@@ -598,11 +585,6 @@ def minute_from_sportsdb(ev: dict) -> str:
         return ""
     return mt
 
-def sportsdb_candidate_score(ev: dict, home_q: str, away_q: str) -> Tuple[bool, int, int, int, str, str]:
-    h, a = teams_from_sportsdb(ev)
-    return passes_hard_gate(h, a, home_q, away_q)
-
-# ---- Team index ----
 async def fetch_all_teams_in_league_sportsdb(league_id: int) -> List[dict]:
     if not SPORTSDB_ENABLED:
         return []
@@ -680,10 +662,6 @@ async def fetch_livescore_sportsdb() -> List[dict]:
     return js.get("events") or []
 
 async def find_best_live_event_sportsdb(state: Dict[str, Any], home: str, away: str) -> Optional[dict]:
-    """
-    live-first sin sesgo: solo acepta si pasa hard-gate fuerte.
-    Si tenemos IDs de ambos equipos y coincide el set de IDs -> preferencia máxima.
-    """
     await ensure_team_index_sportsdb(state)
     home_hit = best_team_from_index(state, home)
     away_hit = best_team_from_index(state, away)
@@ -700,12 +678,10 @@ async def find_best_live_event_sportsdb(state: Dict[str, Any], home: str, away: 
 
         ok, pair, s1, s2, mode, reason = passes_hard_gate(ev_home, ev_away, home, away)
 
-        # si tenemos ambos IDs, exigimos match real por IDs (para evitar “en vivo gana”)
         if home_id and away_id:
             if {ev_hid, ev_aid} != {home_id, away_id}:
                 continue
             if ok:
-                # boost determinista solo por IDs correctos (no por estado)
                 pair += 40
         else:
             if not ok:
@@ -716,13 +692,7 @@ async def find_best_live_event_sportsdb(state: Dict[str, Any], home: str, away: 
     scored.sort(key=lambda x: x[0], reverse=True)
     if scored:
         best_pair, best_ev, why = scored[0]
-        top3 = scored[:3]
         try:
-            log.info(
-                "SportsDB live-first candidates for '%s vs %s': %s",
-                home, away,
-                "; ".join([f"{teams_from_sportsdb(e)[0]} vs {teams_from_sportsdb(e)[1]} pair={p}" for p, e, _ in top3])
-            )
             log.info("SportsDB live-first selected pair=%s why=%s", best_pair, why)
         except Exception:
             pass
@@ -730,11 +700,6 @@ async def find_best_live_event_sportsdb(state: Dict[str, Any], home: str, away: 
     return None
 
 async def find_best_event_sportsdb(state: Dict[str, Any], home: str, away: str, target_date: Optional[date]) -> Optional[dict]:
-    """
-    NUEVO orden:
-      1) Resolver por team IDs (index -> searchteams) y usar eventsnext/eventslast (espacio pequeño)
-      2) Solo si falla, usar eventsday como último recurso
-    """
     if not SPORTSDB_ENABLED:
         return None
 
@@ -743,7 +708,6 @@ async def find_best_event_sportsdb(state: Dict[str, Any], home: str, away: str, 
 
     await ensure_team_index_sportsdb(state)
 
-    # 1) IDs por índice o searchteams
     home_hit = best_team_from_index(state, home)
     away_hit = best_team_from_index(state, away)
 
@@ -765,14 +729,12 @@ async def find_best_event_sportsdb(state: Dict[str, Any], home: str, away: str, 
         except Exception:
             pass
 
-    # 1A) Eventos del equipo (ventana pequeña)
     candidates: List[dict] = []
     if home_id:
         candidates.extend(await fetch_team_events_window(home_id))
     if away_id:
         candidates.extend(await fetch_team_events_window(away_id))
 
-    # dedupe por idEvent
     seen = set()
     cand2 = []
     for ev in candidates:
@@ -783,7 +745,6 @@ async def find_best_event_sportsdb(state: Dict[str, Any], home: str, away: str, 
         cand2.append(ev)
     candidates = cand2
 
-    # filtro por fecha (si existe dateEvent)
     c_by_date = [ev for ev in candidates if (ev.get("dateEvent") or "").strip() in valid_dates]
     candidates = c_by_date or candidates
 
@@ -797,17 +758,10 @@ async def find_best_event_sportsdb(state: Dict[str, Any], home: str, away: str, 
 
     scored.sort(key=lambda x: x[0], reverse=True)
     if scored:
-        top3 = scored[:3]
-        log.info(
-            "SportsDB team-events candidates for '%s vs %s': %s",
-            home, away,
-            "; ".join([f"{teams_from_sportsdb(e)[0]} vs {teams_from_sportsdb(e)[1]} pair={p}" for p, e, _ in top3])
-        )
         best_pair, best_ev, why = scored[0]
         log.info("SportsDB team-events selected pair=%s why=%s", best_pair, why)
         return best_ev
 
-    # 2) Último recurso: eventsday (pero con hard gate)
     day_candidates: List[dict] = []
     for dlt in range(-DATE_WINDOW_DAYS, DATE_WINDOW_DAYS + 1):
         d = td + timedelta(days=dlt)
@@ -829,12 +783,6 @@ async def find_best_event_sportsdb(state: Dict[str, Any], home: str, away: str, 
 
     scored2.sort(key=lambda x: x[0], reverse=True)
     if scored2:
-        top3 = scored2[:3]
-        log.info(
-            "SportsDB eventsday candidates for '%s vs %s': %s",
-            home, away,
-            "; ".join([f"{teams_from_sportsdb(e)[0]} vs {teams_from_sportsdb(e)[1]} pair={p}" for p, e, _ in top3])
-        )
         best_pair, best_ev, why = scored2[0]
         log.info("SportsDB eventsday selected pair=%s why=%s", best_pair, why)
         return best_ev
@@ -962,10 +910,6 @@ async def apisports_team_id(state: Dict[str, Any], team_name: str) -> Optional[i
     state["team_cache"] = cache
     return best_id
 
-def apisports_candidate_score(fx: dict, home_q: str, away_q: str) -> Tuple[bool, int, int, int, str, str]:
-    h, a = teams_from_apisports(fx)
-    return passes_hard_gate(h, a, home_q, away_q)
-
 async def find_best_event_apisports(state: Dict[str, Any], home: str, away: str, target_date: Optional[date]) -> Optional[dict]:
     if not APISPORTS_KEY:
         return None
@@ -999,19 +943,14 @@ async def find_best_event_apisports(state: Dict[str, Any], home: str, away: str,
                 if away_id not in {th, ta}:
                     continue
 
-            ok, pair, s1, s2, mode, reason = apisports_candidate_score(fx, home, away)
+            h, a = teams_from_apisports(fx)
+            ok, pair, s1, s2, mode, reason = passes_hard_gate(h, a, home, away)
             if not ok:
                 continue
             scored.append((pair, fx, f"{reason} mode={mode} s1={s1} s2={s2}"))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     if scored:
-        top3 = scored[:3]
-        log.info(
-            "API-SPORTS candidates for '%s vs %s': %s",
-            home, away,
-            "; ".join([f"{teams_from_apisports(f)[0]} vs {teams_from_apisports(f)[1]} pair={p}" for p, f, _ in top3])
-        )
         best_pair, best_fx, why = scored[0]
         log.info("API-SPORTS selected pair=%s why=%s", best_pair, why)
         return best_fx
@@ -1089,10 +1028,6 @@ async def resolve_match(
     away: str,
     target_date: Optional[date],
 ) -> Tuple[Optional[str], Optional[str], Optional[dict], Optional[dict]]:
-    """
-    Devuelve: (provider, match_id, ev_sportsdb, fx_apisports)
-    Reutiliza cache por query_key.
-    """
     cleanup_query_cache(state)
 
     qkey = make_query_key(home, away, target_date)
@@ -1106,7 +1041,6 @@ async def resolve_match(
         except Exception:
             pass
 
-    # 0) Live-first SportsDB (1 request) si está ON, pero SOLO si pasa hard gate
     if SPORTSDB_ENABLED and USE_SPORTSDB_LIVE_FIRST:
         try:
             live_ev = await find_best_live_event_sportsdb(state, home, away)
@@ -1170,7 +1104,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "   (multi-pick: pick=O1.5,O2.5)\n"
         "• /seguirvarios (1 por línea) | pick=<PICK_GLOBAL>\n"
         "• /lista\n"
-        "• /borrar <equipo1> vs <equipo2> [YYYY-MM-DD]\n"
+        "• /dejardeseguir <equipo1> vs <equipo2> [YYYY-MM-DD]\n"
+        "   (también funciona /borrar como alias)\n"
         "• /limpiar\n"
         "• /estado\n"
         f"\nTick: {fmt_minutes()}\n"
@@ -1188,7 +1123,6 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     tracked = get_tracked(state)
     st = state.get("stats", {}) or {}
 
-    # NUEVO: intentar construir índice aquí (para que no salga 0 eternamente)
     if SPORTSDB_ENABLED:
         try:
             before_n = len(state.get("team_index") or {})
@@ -1230,7 +1164,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["Partidos seguidos:"]
     for m in tracked:
         prov = f" [{m.provider}]"
-        lines.append(f"• {m.home} vs {m.away}{fmt_pick_inline(m.pick)} ({m.date_str}){prov}")
+        # ✅ SIN FECHA
+        lines.append(f"• {m.home} vs {m.away}{fmt_pick_inline(m.pick)}{prov}")
     await update.message.reply_text("\n".join(lines))
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1240,23 +1175,44 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_state(state)
     await update.message.reply_text("✅ Lista limpiada (y cache reseteada).")
 
+def _pair_norm_sorted(home: str, away: str) -> Tuple[str, str]:
+    a = normalize_team(home)
+    b = normalize_team(away)
+    x, y = sorted([a, b])
+    return x, y
+
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = " ".join(context.args).strip()
+
+    # ✅ Si viene vacío: sin "Uso:" + lista de seguidos
     if not text:
-        await update.message.reply_text("Uso: /borrar Equipo1 vs Equipo2 [YYYY-MM-DD]")
+        state = load_state()
+        tracked = get_tracked(state)
+        if not tracked:
+            await update.message.reply_text("No hay partidos seguidos.")
+            return
+
+        lines = [
+            "Escribe el partido que quieres dejar de seguir, por ejemplo:",
+            "/dejardeseguir Barça vs Levante",
+            "",
+            "Partidos seguidos:",
+        ]
+        for m in tracked:
+            lines.append(f"• {m.home} vs {m.away}")
+        await update.message.reply_text("\n".join(lines))
         return
 
     left = text.split("|", 1)[0].strip()
     parts = left.split()
     d = parse_optional_date(parts)
+
     if d:
         text_teams = " ".join(parts[:-1]).strip()
         date_str = d.strftime("%Y-%m-%d")
-        td = d
     else:
         text_teams = left
-        td = _now_utc().date()
-        date_str = td.strftime("%Y-%m-%d")
+        date_str = ""  # sin fecha
 
     try:
         home, away = parse_teams(text_teams)
@@ -1268,18 +1224,36 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     tracked = get_tracked(state)
     before = len(tracked)
 
-    qkey = make_query_key(home, away, td)
+    pair_set = {normalize_team(home), normalize_team(away)}
 
-    tracked = [
-        m for m in tracked
-        if not (
-            {normalize_team(m.home), normalize_team(m.away)} == {normalize_team(home), normalize_team(away)}
-            and m.date_str == date_str
-        )
-    ]
+    # ✅ BORRADO ROBUSTO:
+    # - con fecha: borra solo ese día
+    # - sin fecha: borra cualquier seguido de esa pareja (cualquier fecha)
+    if d:
+        tracked = [
+            m for m in tracked
+            if not ({normalize_team(m.home), normalize_team(m.away)} == pair_set and m.date_str == date_str)
+        ]
+    else:
+        tracked = [
+            m for m in tracked
+            if not ({normalize_team(m.home), normalize_team(m.away)} == pair_set)
+        ]
 
+    # ✅ Limpieza de query_cache coherente con el borrado
     qc = state.get("query_cache", {}) or {}
-    qc.pop(qkey, None)
+
+    x, y = _pair_norm_sorted(home, away)
+    if d:
+        qkey = f"{x}__{y}__{d.strftime('%Y-%m-%d')}"
+        qc.pop(qkey, None)
+    else:
+        # borra todas las entradas para esa pareja (cualquier fecha)
+        prefix = f"{x}__{y}__"
+        to_del = [k for k in qc.keys() if k.startswith(prefix)]
+        for k in to_del:
+            qc.pop(k, None)
+
     state["query_cache"] = qc
 
     set_tracked(state, tracked)
@@ -1288,7 +1262,7 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if len(tracked) == before:
         await update.message.reply_text("No encontré ese partido en la lista.")
     else:
-        await update.message.reply_text("✅ Partido eliminado.")
+        await update.message.reply_text(f"✅ Dejado de seguir {home} vs {away}")
 
 def _parse_follow_payload(raw: str) -> Tuple[str, str, Optional[date], str]:
     left, tail = (raw.split("|", 1) + [""])[:2]
@@ -1311,7 +1285,7 @@ def _parse_follow_payload(raw: str) -> Tuple[str, str, Optional[date], str]:
 async def cmd_follow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     raw = " ".join(context.args).strip()
     if not raw:
-        await update.message.reply_text("Uso: /seguir Equipo1 vs Equipo2 [YYYY-MM-DD] | pick=...")
+        await update.message.reply_text("Escribe un partido, por ejemplo: /seguir Barça vs Levante | pick=O1.5")
         return
     await _follow_one(update, raw)
 
@@ -1329,7 +1303,7 @@ async def cmd_follow_many(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     lines = [ln.strip() for ln in rest if ln.strip()]
     if not lines:
         await update.message.reply_text(
-            "Uso:\n/seguirvarios | pick=O1.5\nVillarreal vs Valencia\nBarcelona vs Levante | pick=O2.5\n(1 partido por línea)"
+            "Ejemplo:\n/seguirvarios | pick=O1.5\nVillarreal vs Valencia\nBarcelona vs Levante | pick=O2.5\n(1 partido por línea)"
         )
         return
 
@@ -1426,7 +1400,6 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
             log.info("API-SPORTS lookup error: %s", repr(e))
             fx = None
 
-    # Si el lookup falla, invalidamos cache y reintentamos fallback
     if provider == "sportsdb" and not ev:
         qc = state.get("query_cache", {}) or {}
         qc.pop(qkey, None)
@@ -1745,7 +1718,11 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("seguir", cmd_follow))
     app.add_handler(CommandHandler("seguirvarios", cmd_follow_many))
     app.add_handler(CommandHandler("lista", cmd_list))
+
+    # ✅ NUEVO comando principal + alias
+    app.add_handler(CommandHandler("dejardeseguir", cmd_delete))
     app.add_handler(CommandHandler("borrar", cmd_delete))
+
     app.add_handler(CommandHandler("limpiar", cmd_clear))
 
     app.job_queue.run_repeating(job_poll, interval=POLL_SECONDS, first=5)
