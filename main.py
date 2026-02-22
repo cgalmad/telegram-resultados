@@ -59,6 +59,20 @@ QUERY_CACHE_TTL_HOURS = int(os.getenv("QUERY_CACHE_TTL_HOURS", "48").strip())
 MAX_CONSECUTIVE_FAILURES_BEFORE_MIGRATE = int(os.getenv("MAX_CONSECUTIVE_FAILURES_BEFORE_MIGRATE", "2").strip())
 MAX_CONSECUTIVE_FAILURES_BEFORE_DROP = int(os.getenv("MAX_CONSECUTIVE_FAILURES_BEFORE_DROP", "12").strip())
 
+# ===== SportsDB Team Index (por ligas) =====
+SPORTSDB_LEAGUE_IDS = [
+    4337,  # Dutch Eredivisie
+    4328,  # English Premier League
+    4331,  # German Bundesliga
+    4332,  # Italian Serie A
+    4335,  # Spanish La Liga
+    4621,  # Austrian Bundesliga
+    4334,  # French Ligue 1
+    4344,  # Portuguese Primeira Liga
+]
+TEAM_INDEX_TTL_HOURS = int(os.getenv("TEAM_INDEX_TTL_HOURS", "168").strip())  # 7 días
+USE_SPORTSDB_LIVE_FIRST = os.getenv("USE_SPORTSDB_LIVE_FIRST", "1").strip() not in {"0","false","False","NO","no"}
+
 
 # =========================
 # HELPERS
@@ -88,7 +102,7 @@ _STOPWORDS = {
     "sporting","sports","football","futbol","fútbol",
     "team","clubdeportivo","clubde","clubdeportivo",
     "sv","bv","vv","v.v.","v.v","v","fk","sk",
-    "ss","as","ks","nk","rc","real",  # "real" a veces ayuda, pero también estorba: lo quitamos para ser permissivo
+    "ss","as","ks","nk","rc","real",
 }
 
 # alias rápidos (opcionales) para casos comunes
@@ -111,7 +125,6 @@ def normalize_team(s: str) -> str:
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
 
-    # aplica alias por string completo si coincide
     if s in _ALIAS:
         s = _ALIAS[s]
 
@@ -120,8 +133,7 @@ def normalize_team(s: str) -> str:
         if p in _STOPWORDS:
             continue
         parts.append(p)
-    s = " ".join(parts).strip()
-    return s
+    return " ".join(parts).strip()
 
 def team_tokens(s: str) -> set:
     return set(normalize_team(s).split())
@@ -145,7 +157,6 @@ def string_similarity(a: str, b: str) -> float:
 def parse_teams(text: str) -> Tuple[str, str]:
     t = re.sub(r"\s+", " ", text.strip())
 
-    # separadores comunes
     if re.search(r"\s+vs\s+", t, flags=re.IGNORECASE):
         a, b = re.split(r"\s+vs\s+", t, flags=re.IGNORECASE, maxsplit=1)
     elif re.search(r"\s+v\s+", t, flags=re.IGNORECASE):
@@ -233,7 +244,6 @@ def cleanup_query_cache(state: Dict[str, Any]) -> None:
     state["query_cache"] = qc
 
 def unfollow_cmd_line(m: "TrackedMatch") -> str:
-    # comando pinchable: empieza por /
     return f"/borrar {m.home} vs {m.away} {m.date_str}"
 
 def minute_prefix(minute: str) -> str:
@@ -242,11 +252,30 @@ def minute_prefix(minute: str) -> str:
         return ""
     if minute.endswith("'"):
         return f"⏱ {minute} "
-    # sportsdb a veces da "67" o "67:xx"
     m2 = re.sub(r"[^\d]", "", minute)
     if m2.isdigit():
         return f"⏱ {m2}' "
     return f"⏱ {minute} "
+
+def split_alternates(s: str) -> List[str]:
+    if not s:
+        return []
+    parts = re.split(r"[;|/]", s)
+    out = []
+    for p in parts:
+        p = (p or "").strip()
+        if p:
+            out.append(p)
+    return out
+
+def parse_state_dt(s: str) -> Optional[datetime]:
+    return parse_iso_dt(s)
+
+def is_state_fresh(saved_iso: str, ttl_hours: int) -> bool:
+    dt = parse_state_dt(saved_iso or "")
+    if not dt:
+        return False
+    return (_now_utc() - dt) <= timedelta(hours=ttl_hours)
 
 
 # =========================
@@ -260,19 +289,16 @@ def normalize_pick_one(p: str) -> str:
     return p
 
 def normalize_pick(p: str) -> str:
-    # admite "O1.5,O2.5" etc.
     raw = (p or "").strip()
     if not raw:
         return ""
     parts = [x.strip() for x in raw.split(",") if x.strip()]
     norm = [normalize_pick_one(x) for x in parts]
-    # mantiene coma como separador estándar
     return ",".join([x for x in norm if x])
 
 def parse_pick_from_tail(tail: str) -> str:
     if not tail:
         return ""
-    # captura también comas: pick=O1.5,O2.5
     m = re.search(r"(?:^|[\s,])pick\s*=\s*([A-Za-z0-9\.\+\-,]+)", tail, flags=re.IGNORECASE)
     if not m:
         return ""
@@ -286,7 +312,6 @@ def fmt_pick(pick: str) -> str:
     pick = (pick or "").strip()
     if not pick:
         return ""
-    # bonito para alertas
     if "," in pick:
         return f"\nPICKS: {pick}"
     return f"\nPICK: {pick}"
@@ -316,18 +341,23 @@ class TrackedMatch:
 
     seen_timeline_ids: List[str] = field(default_factory=list)
 
-    # robustez / debug
     query_key: str = ""
     created_utc: str = ""
     consecutive_failures: int = 0
 
-    # anti-spam
     last_alert_utc: str = ""
 
 
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_FILE):
-        return {"tracked": [], "team_cache": {}, "query_cache": {}, "stats": {}}
+        return {
+            "tracked": [],
+            "team_cache": {},
+            "query_cache": {},
+            "stats": {},
+            "team_index": {},
+            "team_index_meta": {},
+        }
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             js = json.load(f)
@@ -335,10 +365,19 @@ def load_state() -> Dict[str, Any]:
         js.setdefault("team_cache", {})
         js.setdefault("query_cache", {})
         js.setdefault("stats", {})
+        js.setdefault("team_index", {})
+        js.setdefault("team_index_meta", {})
         return js
     except Exception:
         log.exception("No se pudo leer state.json, empezando limpio.")
-        return {"tracked": [], "team_cache": {}, "query_cache": {}, "stats": {}}
+        return {
+            "tracked": [],
+            "team_cache": {},
+            "query_cache": {},
+            "stats": {},
+            "team_index": {},
+            "team_index_meta": {},
+        }
 
 def save_state(state: Dict[str, Any]) -> None:
     tmp = STATE_FILE + ".tmp"
@@ -501,7 +540,6 @@ def minute_from_sportsdb(ev: dict) -> str:
         return m
     mt = ev.get("intTime") or ev.get("strTime") or ""
     mt = str(mt).strip()
-    # si es "HH:MM" no es minuto de partido
     if re.fullmatch(r"\d{2}:\d{2}(:\d{2})?", mt):
         return ""
     return mt
@@ -515,10 +553,8 @@ def event_match_score_sportsdb(ev: dict, home_q: str, away_q: str) -> int:
     if e_set == q_set:
         score += 150
     else:
-        # token matching (simétrico)
         score += int(85 * max(token_similarity(h, home_q), token_similarity(h, away_q)))
         score += int(85 * max(token_similarity(a, home_q), token_similarity(a, away_q)))
-        # string matching (reduce problemas de naming)
         score += int(70 * max(string_similarity(h, home_q), string_similarity(h, away_q)))
         score += int(70 * max(string_similarity(a, home_q), string_similarity(a, away_q)))
 
@@ -529,6 +565,124 @@ def event_match_score_sportsdb(ev: dict, home_q: str, away_q: str) -> int:
     if hs is not None or as_ is not None:
         score += 5
     return score
+
+# ---- Team index + Live-first (SportsDB) ----
+async def fetch_all_teams_in_league_sportsdb(league_id: int) -> List[dict]:
+    if not SPORTSDB_ENABLED:
+        return []
+    url = f"{SPORTSDB_BASE}/lookup_all_teams.php"
+    js = await http_get_json(url, params={"id": str(league_id)})
+    return js.get("teams") or []
+
+async def ensure_team_index_sportsdb(state: Dict[str, Any]) -> None:
+    idx_meta = (state.get("team_index_meta") or {})
+    if is_state_fresh(idx_meta.get("saved_utc", ""), TEAM_INDEX_TTL_HOURS) and state.get("team_index"):
+        return
+
+    team_index: Dict[str, Dict[str, str]] = {}
+    for lid in SPORTSDB_LEAGUE_IDS:
+        try:
+            teams = await fetch_all_teams_in_league_sportsdb(lid)
+        except Exception as e:
+            log.info("Team index: fallo liga %s: %s", lid, repr(e))
+            continue
+
+        for t in teams:
+            tid = str(t.get("idTeam") or "").strip()
+            name = (t.get("strTeam") or "").strip()
+            alt = (t.get("strAlternate") or "").strip()
+            if not tid or not name:
+                continue
+
+            candidates = [name] + split_alternates(alt)
+            for cand in candidates:
+                k = normalize_team(cand)
+                if not k:
+                    continue
+                if k not in team_index:
+                    team_index[k] = {"idTeam": tid, "strTeam": name}
+
+    state["team_index"] = team_index
+    state["team_index_meta"] = {"saved_utc": now_iso(), "league_ids": SPORTSDB_LEAGUE_IDS}
+
+def best_team_from_index(state: Dict[str, Any], query_name: str) -> Optional[Tuple[str, str]]:
+    idx = state.get("team_index") or {}
+    if not idx:
+        return None
+
+    qn = (query_name or "").strip()
+    nq = normalize_team(qn)
+    if not nq:
+        return None
+
+    if nq in idx:
+        it = idx[nq]
+        return it["idTeam"], it["strTeam"]
+
+    best_k = None
+    best_sc = -1.0
+    for k in idx.keys():
+        ts = token_similarity(k, nq)
+        ss = SequenceMatcher(None, k, nq).ratio()
+        sc = 0.65 * ts + 0.35 * ss
+        if sc > best_sc:
+            best_sc = sc
+            best_k = k
+
+    if best_k and best_sc >= 0.45:
+        it = idx[best_k]
+        return it["idTeam"], it["strTeam"]
+
+    return None
+
+async def fetch_livescore_sportsdb() -> List[dict]:
+    if not SPORTSDB_ENABLED:
+        return []
+    url = f"{SPORTSDB_BASE}/livescore.php"
+    js = await http_get_json(url, params={"s": "Soccer"})
+    return js.get("events") or []
+
+def event_score_by_team_ids(ev: dict, home_id: Optional[str], away_id: Optional[str], home_q: str, away_q: str) -> int:
+    score = 0
+    ev_hid = str(ev.get("idHomeTeam") or "").strip()
+    ev_aid = str(ev.get("idAwayTeam") or "").strip()
+
+    if home_id and away_id:
+        if {ev_hid, ev_aid} == {home_id, away_id}:
+            return 1000
+        if home_id in {ev_hid, ev_aid}:
+            score += 200
+        if away_id in {ev_hid, ev_aid}:
+            score += 200
+
+    score += event_match_score_sportsdb(ev, home_q, away_q)
+    return score
+
+async def find_best_live_event_sportsdb(state: Dict[str, Any], home: str, away: str) -> Optional[dict]:
+    await ensure_team_index_sportsdb(state)
+    home_hit = best_team_from_index(state, home)
+    away_hit = best_team_from_index(state, away)
+    home_id = home_hit[0] if home_hit else None
+    away_id = away_hit[0] if away_hit else None
+
+    events = await fetch_livescore_sportsdb()
+    best_ev = None
+    best_sc = -1
+    for ev in events:
+        sc = event_score_by_team_ids(ev, home_id, away_id, home, away)
+        if sc > best_sc:
+            best_sc, best_ev = sc, ev
+
+    if home_id and away_id:
+        if best_ev and best_sc >= 900:
+            return best_ev
+        return None
+
+    if best_ev and best_sc >= max(MIN_MATCH_SCORE, 60):
+        return best_ev
+    return None
+
+# ---- end live-first ----
 
 async def find_best_event_sportsdb(home: str, away: str, target_date: Optional[date]) -> Optional[dict]:
     if not SPORTSDB_ENABLED:
@@ -557,7 +711,6 @@ async def find_best_event_sportsdb(home: str, away: str, target_date: Optional[d
     if best_ev and best_sc >= MIN_MATCH_SCORE:
         return best_ev
 
-    # Fallback 1: ventana por equipo (home)
     try:
         home_team = await search_team_id_sportsdb(home)
         if home_team:
@@ -577,7 +730,6 @@ async def find_best_event_sportsdb(home: str, away: str, target_date: Optional[d
     except Exception as e:
         log.info("Fallback por equipo (SportsDB home) falló: %s", repr(e))
 
-    # Fallback 2: ventana por equipo (away) — ayuda si el home no existe por naming
     try:
         away_team = await search_team_id_sportsdb(away)
         if away_team:
@@ -613,9 +765,7 @@ async def verify_event_usable_sportsdb(event_id: str) -> bool:
     try:
         ev = await fetch_event_by_id_sportsdb(event_id)
         return ev is not None
-    except Exception as e:
-        if is_sportsdb_unusable_error(e):
-            return False
+    except Exception:
         return False
 
 async def fetch_timeline_sportsdb(event_id: str) -> List[dict]:
@@ -688,7 +838,6 @@ async def apisports_team_id(state: Dict[str, Any], team_name: str) -> Optional[i
     js = await http_get_json(url, params={"search": team_name}, headers=apisports_headers())
     resp = js.get("response") or []
     if not resp:
-        # fallback: intentar con el normalizado por si el input era raro
         team_name2 = normalize_team(team_name)
         if team_name2 and team_name2 != team_name:
             js = await http_get_json(url, params={"search": team_name2}, headers=apisports_headers())
@@ -753,7 +902,6 @@ async def find_best_event_apisports(state: Dict[str, Any], home: str, away: str,
     home_id = await apisports_team_id(state, home)
     away_id = await apisports_team_id(state, away)
 
-    # si el home no sale por naming, intenta con el normalizado
     if home_id is None:
         home2 = normalize_team(home)
         if home2 and home2 != home:
@@ -788,7 +936,6 @@ async def find_best_event_apisports(state: Dict[str, Any], home: str, away: str,
     if best and best_sc >= MIN_MATCH_SCORE:
         return best
 
-    # fallback extra: si no hubo match por away_id (naming), intenta scoring sin filtrar por id
     if away_id is None:
         for dlt in range(-DATE_WINDOW_DAYS, DATE_WINDOW_DAYS + 1):
             d = td + timedelta(days=dlt)
@@ -899,6 +1046,19 @@ async def resolve_match(
         except Exception:
             pass
 
+    # 0) Live-first SportsDB (1 request) si está ON
+    if SPORTSDB_ENABLED and USE_SPORTSDB_LIVE_FIRST:
+        try:
+            live_ev = await find_best_live_event_sportsdb(state, home, away)
+            if live_ev:
+                mid = str(live_ev.get("idEvent") or "").strip()
+                if mid and await verify_event_usable_sportsdb(mid):
+                    qcache[qkey] = {"provider": "sportsdb", "match_id": mid, "saved_utc": now_iso()}
+                    state["query_cache"] = qcache
+                    return "sportsdb", mid, live_ev, None
+        except Exception as e:
+            log.info("Live-first SportsDB falló: %s", repr(e))
+
     if PREFER_APISPORTS and APISPORTS_KEY:
         order = ["apisports", "sportsdb"]
     else:
@@ -956,6 +1116,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"\nTick: {fmt_minutes()}\n"
         f"SportsDB: {'ON' if SPORTSDB_ENABLED else 'OFF'} | API-SPORTS: {'ON' if APISPORTS_KEY else 'OFF'}\n"
         f"Prefer API-SPORTS: {'YES' if (PREFER_APISPORTS and APISPORTS_KEY) else 'NO'}\n"
+        f"SportsDB live-first: {'YES' if (SPORTSDB_ENABLED and USE_SPORTSDB_LIVE_FIRST) else 'NO'}\n"
+        f"Team index TTL: {TEAM_INDEX_TTL_HOURS}h\n"
         f"Auto remove finished: {'YES' if AUTO_REMOVE_FINISHED else 'NO'}"
     )
     await update.message.reply_text(help_text)
@@ -967,12 +1129,15 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cleanup_query_cache(state)
     save_state(state)
 
+    ti = state.get("team_index") or {}
     lines = [
         "Estado del bot:",
         f"- Tick: {fmt_minutes()}",
         f"- SportsDB: {'ON' if SPORTSDB_ENABLED else 'OFF'}",
         f"- API-SPORTS: {'ON' if APISPORTS_KEY else 'OFF'}",
         f"- Prefer API-SPORTS: {'YES' if (PREFER_APISPORTS and APISPORTS_KEY) else 'NO'}",
+        f"- SportsDB live-first: {'YES' if (SPORTSDB_ENABLED and USE_SPORTSDB_LIVE_FIRST) else 'NO'}",
+        f"- Team index keys: {len(ti)} (TTL {TEAM_INDEX_TTL_HOURS}h)",
         f"- Auto remove finished: {'YES' if AUTO_REMOVE_FINISHED else 'NO'}",
         f"- Seguidos: {len(tracked)}",
         f"- Query cache: {len((state.get('query_cache') or {}))} (TTL {QUERY_CACHE_TTL_HOURS}h)",
@@ -1077,11 +1242,6 @@ async def cmd_follow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await _follow_one(update, raw)
 
 async def cmd_follow_many(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /seguirvarios | pick=O1.5,O2.5
-    Villarreal vs Valencia
-    Barcelona vs Levante 2026-02-22 | pick=O2.5,O3.5
-    """
     msg = (update.message.text or "").strip()
     if not msg:
         return
@@ -1132,6 +1292,18 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
         return ("fail", f"❌ {raw} -> {e}")
 
     state = load_state()
+
+    # (muy recomendado) índice listo al usar /seguir
+    if SPORTSDB_ENABLED:
+        try:
+            before_n = len(state.get("team_index") or {})
+            await ensure_team_index_sportsdb(state)
+            after_n = len(state.get("team_index") or {})
+            if after_n != before_n:
+                save_state(state)
+        except Exception as e:
+            log.info("ensure_team_index_sportsdb falló (se continúa): %s", repr(e))
+
     cleanup_query_cache(state)
     tracked = get_tracked(state)
     qkey = make_query_key(home, away, target_date)
@@ -1166,7 +1338,6 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
             await update.message.reply_text(msg)
         return ("fail", msg)
 
-    # cargar detalles si venía de cache
     if provider == "sportsdb" and ev is None:
         try:
             ev = await fetch_event_by_id_sportsdb(match_id)
@@ -1182,7 +1353,6 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
             log.info("API-SPORTS lookup error: %s", repr(e))
             fx = None
 
-    # si cache apunta a algo roto, invalida y reintenta alternativo 1 vez
     if provider == "sportsdb" and not ev:
         qc = state.get("query_cache", {}) or {}
         qc.pop(qkey, None)
@@ -1227,7 +1397,6 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
                     await update.message.reply_text(msg)
                 return ("fail", msg)
 
-    # normaliza datos
     if provider == "sportsdb":
         h_ev, a_ev = teams_from_sportsdb(ev)
         ev_date = (ev.get("dateEvent") or ((target_date or _now_utc().date()).strftime("%Y-%m-%d"))).strip()
@@ -1320,7 +1489,6 @@ async def poll_once(app: Application) -> None:
         fx = None
         now = _now_utc()
 
-        # fetch
         try:
             if m.provider == "sportsdb":
                 ev = await fetch_event_by_id_sportsdb(m.match_id)
@@ -1382,7 +1550,6 @@ async def poll_once(app: Application) -> None:
             kept.append(m)
             continue
 
-        # parse + minute
         if m.provider == "sportsdb":
             home, away = teams_from_sportsdb(ev)
             hs, aas = score_from_sportsdb(ev)
@@ -1398,7 +1565,6 @@ async def poll_once(app: Application) -> None:
             bucket = status_bucket(status)
             timeline_fetch = False
 
-        # EMPIEZA
         if bucket == "INPLAY" and not m.started_notified:
             if should_send(now, m.last_alert_utc):
                 await send_msg(app, f"🔔 EMPIEZA: {home} vs {away} ({m.league}){fmt_pick(m.pick)}")
@@ -1406,7 +1572,6 @@ async def poll_once(app: Application) -> None:
             m.started_notified = True
             changed_any = True
 
-        # DESCANSO
         if (status.upper() == "HT" or "HALF" in status.upper()) and not m.ht_notified:
             if should_send(now, m.last_alert_utc):
                 await send_msg(app, f"⏸ DESCANSO: {fmt_score(home, away, hs, aas)}{fmt_pick(m.pick)}")
@@ -1414,7 +1579,6 @@ async def poll_once(app: Application) -> None:
             m.ht_notified = True
             changed_any = True
 
-        # FINAL
         if bucket == "FINISHED" and not m.ft_notified:
             if should_send(now, m.last_alert_utc):
                 await send_msg(app, f"🏁 FINAL: {fmt_score(home, away, hs, aas)}{fmt_pick(m.pick)}")
@@ -1423,7 +1587,6 @@ async def poll_once(app: Application) -> None:
             m.started_notified = True
             changed_any = True
 
-        # ANTI-VAR / GOL
         if (
             m.last_home is not None and m.last_away is not None
             and hs is not None and aas is not None
@@ -1450,7 +1613,6 @@ async def poll_once(app: Application) -> None:
                         m.last_alert_utc = now_iso()
                     changed_any = True
 
-        # Timeline (solo SportsDB)
         if timeline_fetch and bucket == "INPLAY":
             try:
                 tl = await fetch_timeline_sportsdb(m.match_id)
@@ -1473,7 +1635,6 @@ async def poll_once(app: Application) -> None:
             except Exception:
                 log.info("Timeline no disponible o error para %s", m.match_id)
 
-        # update last values
         if hs is not None and hs != m.last_home:
             m.last_home = hs
             changed_any = True
@@ -1484,7 +1645,6 @@ async def poll_once(app: Application) -> None:
             m.last_status = status
             changed_any = True
 
-        # auto-remove finished
         if bucket == "FINISHED" and m.ft_notified and AUTO_REMOVE_FINISHED:
             changed_any = True
             continue
@@ -1523,10 +1683,11 @@ def main() -> None:
     app = build_app()
     log.info("Bot started. Target chat id: %s", TARGET_CHAT_ID)
     log.info(
-        "SPORTSDB=%s | APISPORTS=%s | PREFER_APISPORTS=%s | AUTO_REMOVE_FINISHED=%s",
+        "SPORTSDB=%s | APISPORTS=%s | PREFER_APISPORTS=%s | LIVE_FIRST=%s | AUTO_REMOVE_FINISHED=%s",
         "ON" if SPORTSDB_ENABLED else "OFF",
         "ON" if APISPORTS_KEY else "OFF",
         "YES" if (PREFER_APISPORTS and APISPORTS_KEY) else "NO",
+        "YES" if (SPORTSDB_ENABLED and USE_SPORTSDB_LIVE_FIRST) else "NO",
         "YES" if AUTO_REMOVE_FINISHED else "NO",
     )
     app.run_polling(drop_pending_updates=True)
