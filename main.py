@@ -217,6 +217,16 @@ def parse_pick_from_tail(tail: str) -> str:
         return ""
     return normalize_pick(m.group(1))
 
+def fmt_pick_inline(pick: str) -> str:
+    """Formato compacto para listas / líneas: ' (pick=O1.5)'."""
+    pick = (pick or "").strip()
+    return f" (pick={pick})" if pick else ""
+
+def fmt_pick(pick: str) -> str:
+    """Formato para alerts (multilínea)."""
+    pick = (pick or "").strip()
+    return f"\nPICK: {pick}" if pick else ""
+
 
 # =========================
 # STATE
@@ -285,6 +295,7 @@ def get_tracked(state: Dict[str, Any]) -> List[TrackedMatch]:
             it.setdefault("created_utc", "")
             it.setdefault("consecutive_failures", 0)
             it.setdefault("last_alert_utc", "")
+            it.setdefault("pick", "")
             out.append(TrackedMatch(**it))
         except Exception:
             log.exception("Entrada inválida en state.json, se ignora: %s", it)
@@ -645,7 +656,11 @@ async def find_best_event_apisports(state: Dict[str, Any], home: str, away: str,
     for dlt in range(-DATE_WINDOW_DAYS, DATE_WINDOW_DAYS + 1):
         d = td + timedelta(days=dlt)
         url = f"{APISPORTS_BASE}/fixtures"
-        js = await http_get_json(url, params={"date": d.strftime("%Y-%m-%d"), "team": home_id}, headers=apisports_headers())
+        js = await http_get_json(
+            url,
+            params={"date": d.strftime("%Y-%m-%d"), "team": home_id},
+            headers=apisports_headers(),
+        )
         resp = js.get("response") or []
         for fx in resp:
             if away_id is not None:
@@ -684,10 +699,6 @@ def fmt_score(home: str, away: str, hs: Optional[int], aas: Optional[int]) -> st
     if hs is None or aas is None:
         return f"{home} vs {away}"
     return f"{home} {hs}–{aas} {away}"
-
-def fmt_pick(pick: str) -> str:
-    pick = (pick or "").strip()
-    return f"\nPICK: {pick}" if pick else ""
 
 
 # =========================
@@ -733,7 +744,12 @@ async def migrate_match_to_apisports(state: Dict[str, Any], m: TrackedMatch) -> 
 # =========================
 # RESOLVER (DETERMINISTA)
 # =========================
-async def resolve_match(state: Dict[str, Any], home: str, away: str, target_date: Optional[date]) -> Tuple[Optional[str], Optional[str], Optional[dict], Optional[dict]]:
+async def resolve_match(
+    state: Dict[str, Any],
+    home: str,
+    away: str,
+    target_date: Optional[date],
+) -> Tuple[Optional[str], Optional[str], Optional[dict], Optional[dict]]:
     """
     Devuelve: (provider, match_id, ev_sportsdb, fx_apisports)
     Garantía: si ya se resolvió antes con el mismo comando (query_key), reutiliza cache.
@@ -751,7 +767,6 @@ async def resolve_match(state: Dict[str, Any], home: str, away: str, target_date
         except Exception:
             pass
 
-    order: List[str]
     if PREFER_APISPORTS and APISPORTS_KEY:
         order = ["apisports", "sportsdb"]
     else:
@@ -804,7 +819,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "   Ej:\n"
         "   /seguirvarios | pick=O1.5\n"
         "   Villarreal vs Valencia\n"
-        "   Barcelona vs Levante\n"
+        "   Barcelona vs Levante | pick=O2.5\n"
         "• /lista\n"
         "• /borrar <equipo1> vs <equipo2> [YYYY-MM-DD]\n"
         "• /limpiar\n"
@@ -846,9 +861,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     lines = ["Partidos seguidos:"]
     for m in tracked:
-        p = f" | pick={m.pick}" if m.pick else ""
         prov = f" [{m.provider}]"
-        lines.append(f"• {m.home} vs {m.away} ({m.date_str}){p}{prov}")
+        lines.append(f"• {m.home} vs {m.away}{fmt_pick_inline(m.pick)} ({m.date_str}){prov}")
     await update.message.reply_text("\n".join(lines))
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -944,7 +958,6 @@ async def cmd_follow_many(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     first_line, *rest = msg.splitlines()
-    # global pick in first line
     global_pick = ""
     if "|" in first_line:
         _, tail = first_line.split("|", 1)
@@ -953,7 +966,7 @@ async def cmd_follow_many(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     lines = [ln.strip() for ln in rest if ln.strip()]
     if not lines:
         await update.message.reply_text(
-            "Uso:\n/seguirvarios | pick=O1.5\nVillarreal vs Valencia\nBarcelona vs Levante\n(1 partido por línea)"
+            "Uso:\n/seguirvarios | pick=O1.5\nVillarreal vs Valencia\nBarcelona vs Levante | pick=O2.5\n(1 partido por línea)"
         )
         return
 
@@ -962,15 +975,14 @@ async def cmd_follow_many(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     fail = 0
     msgs = []
 
-    # Procesa secuencial (evita rate-limit upstream)
     for ln in lines:
-        # si la línea no tiene pick y hay global, lo añadimos al raw
         if "pick=" not in ln.lower() and global_pick:
             raw = f"{ln} | pick={global_pick}"
         else:
             raw = ln
+
         res = await _follow_one(update, raw, silent=True)
-        # res: ("ok"|"exist"|"fail", message)
+
         if res[0] == "ok":
             ok += 1
         elif res[0] == "exist":
@@ -979,7 +991,6 @@ async def cmd_follow_many(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             fail += 1
         msgs.append(res[1])
 
-    # resumen + detalle
     header = f"Resumen: ✅ {ok} añadidos | ♻️ {exist} ya existían | ❌ {fail} no encontrados"
     await update.message.reply_text(header + "\n\n" + "\n".join(msgs))
 
@@ -1011,11 +1022,12 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
         if changed:
             set_tracked(state, tracked)
             save_state(state)
-            msg = f"♻️ {already.home} vs {already.away} ({already.date_str}) pick={already.pick} [{already.provider}] (actualizado)"
+            msg = f"♻️ {already.home} vs {already.away}{fmt_pick_inline(already.pick)} ({already.date_str}) [{already.provider}] (actualizado)"
             if not silent:
                 await update.message.reply_text(msg)
             return ("exist", msg)
-        msg = f"♻️ {already.home} vs {already.away} ({already.date_str}) [{already.provider}]"
+
+        msg = f"♻️ {already.home} vs {already.away}{fmt_pick_inline(already.pick)} ({already.date_str}) [{already.provider}]"
         if not silent:
             await update.message.reply_text(msg)
         return ("exist", msg)
@@ -1023,7 +1035,7 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
     provider, match_id, ev, fx = await resolve_match(state, home, away, target_date)
     if not provider or not match_id:
         save_state(state)
-        msg = f"❌ {home} vs {away} -> no encontrado (±{DATE_WINDOW_DAYS}d)"
+        msg = f"❌ {home} vs {away}{fmt_pick_inline(pick)} -> no encontrado (±{DATE_WINDOW_DAYS}d)"
         if not silent:
             await update.message.reply_text(msg)
         return ("fail", msg)
@@ -1058,7 +1070,7 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
                 state["query_cache"][qkey] = {"provider": provider, "match_id": match_id, "saved_utc": now_iso()}
             else:
                 save_state(state)
-                msg = f"❌ {home} vs {away} -> ID cache roto (SportsDB) y no hay fallback"
+                msg = f"❌ {home} vs {away}{fmt_pick_inline(pick)} -> ID cache roto (SportsDB) y no hay fallback"
                 if not silent:
                     await update.message.reply_text(msg)
                 return ("fail", msg)
@@ -1067,7 +1079,6 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
         qc = state.get("query_cache", {}) or {}
         qc.pop(qkey, None)
         state["query_cache"] = qc
-        # fallback a sportsdb si existe
         if SPORTSDB_ENABLED:
             ev2 = await find_best_event_sportsdb(home, away, target_date)
             if ev2:
@@ -1079,13 +1090,13 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
                     state["query_cache"][qkey] = {"provider": provider, "match_id": match_id, "saved_utc": now_iso()}
                 else:
                     save_state(state)
-                    msg = f"❌ {home} vs {away} -> ID cache roto (API-SPORTS) y fallback no usable"
+                    msg = f"❌ {home} vs {away}{fmt_pick_inline(pick)} -> ID cache roto (API-SPORTS) y fallback no usable"
                     if not silent:
                         await update.message.reply_text(msg)
                     return ("fail", msg)
             else:
                 save_state(state)
-                msg = f"❌ {home} vs {away} -> ID cache roto (API-SPORTS) y fallback no encontrado"
+                msg = f"❌ {home} vs {away}{fmt_pick_inline(pick)} -> ID cache roto (API-SPORTS) y fallback no encontrado"
                 if not silent:
                     await update.message.reply_text(msg)
                 return ("fail", msg)
@@ -1114,7 +1125,7 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
     # si está FINAL y AUTO_REMOVE_FINISHED=1 => solo informa y no guarda
     if bucket == "FINISHED" and AUTO_REMOVE_FINISHED:
         save_state(state)
-        msg = f"🏁 {h_ev} {hs}–{aas} {a_ev} (FINAL) pick={pick}" if pick else f"🏁 {h_ev} {hs}–{aas} {a_ev} (FINAL)"
+        msg = f"🏁 {h_ev} {hs}–{aas} {a_ev} (FINAL){fmt_pick_inline(pick)}"
         if not silent:
             await update.message.reply_text(msg)
         return ("ok", msg)
@@ -1144,23 +1155,23 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
     set_tracked(state, tracked)
     save_state(state)
 
-    extra_pick = f" pick={pick}" if pick else ""
     extra_provider = f" [{provider}]"
+    title = f"{m.home} vs {m.away}{fmt_pick_inline(pick)} ({m.date_str}){extra_provider}"
 
     if bucket == "FINISHED":
-        msg = f"✅ {m.home} vs {m.away} ({m.date_str}){extra_pick}{extra_provider} -> 🏁 FINAL {fmt_score(m.home, m.away, hs, aas)}"
+        msg = f"✅ {title} -> 🏁 FINAL {fmt_score(m.home, m.away, hs, aas)}"
         if not silent:
             await update.message.reply_text(msg)
         return ("ok", msg)
 
     if bucket == "INPLAY":
         min_txt = f" {minute}" if minute else ""
-        msg = f"✅ {m.home} vs {m.away} ({m.date_str}){extra_pick}{extra_provider} -> 🟢 YA INICIADO{min_txt} {fmt_score(m.home, m.away, hs, aas)}"
+        msg = f"✅ {title} -> 🟢 YA INICIADO{min_txt} {fmt_score(m.home, m.away, hs, aas)}"
         if not silent:
             await update.message.reply_text(msg)
         return ("ok", msg)
 
-    msg = f"✅ {m.home} vs {m.away} ({m.date_str}){extra_pick}{extra_provider} -> agregado"
+    msg = f"✅ {title} -> agregado"
     if not silent:
         await update.message.reply_text(msg)
     return ("ok", msg)
@@ -1192,6 +1203,7 @@ async def poll_once(app: Application) -> None:
                     m.consecutive_failures += 1
                     stats_inc(state, "http_errors", 1)
                     changed_any = True
+
                     if m.consecutive_failures >= MAX_CONSECUTIVE_FAILURES_BEFORE_MIGRATE:
                         migrated = await migrate_match_to_apisports(state, m)
                         if migrated:
@@ -1203,12 +1215,12 @@ async def poll_once(app: Application) -> None:
                             ev = None
                             m.consecutive_failures = 0
                             changed_any = True
+
                     if not ev and not fx:
-                        # drop si demasiados fallos consecutivos
                         if m.consecutive_failures >= MAX_CONSECUTIVE_FAILURES_BEFORE_DROP:
                             stats_inc(state, "drops", 1)
                             if should_send(now, m.last_alert_utc):
-                                await send_msg(app, f"🧹 Eliminado por fallos repetidos: {m.home} vs {m.away} ({m.date_str}) [{m.provider}]")
+                                await send_msg(app, f"🧹 Eliminado por fallos repetidos: {m.home} vs {m.away}{fmt_pick_inline(m.pick)} ({m.date_str}) [{m.provider}]")
                                 m.last_alert_utc = now_iso()
                             changed_any = True
                             continue
@@ -1227,7 +1239,7 @@ async def poll_once(app: Application) -> None:
                     if m.consecutive_failures >= MAX_CONSECUTIVE_FAILURES_BEFORE_DROP:
                         stats_inc(state, "drops", 1)
                         if should_send(now, m.last_alert_utc):
-                            await send_msg(app, f"🧹 Eliminado por fallos repetidos: {m.home} vs {m.away} ({m.date_str}) [{m.provider}]")
+                            await send_msg(app, f"🧹 Eliminado por fallos repetidos: {m.home} vs {m.away}{fmt_pick_inline(m.pick)} ({m.date_str}) [{m.provider}]")
                             m.last_alert_utc = now_iso()
                         changed_any = True
                         continue
