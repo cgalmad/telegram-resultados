@@ -7,6 +7,7 @@ import unicodedata
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional, Tuple
+from difflib import SequenceMatcher
 
 import httpx
 from telegram import Update
@@ -47,16 +48,16 @@ MIN_SECONDS_BETWEEN_ALERTS = int(os.getenv("MIN_SECONDS_BETWEEN_ALERTS", "15").s
 INPLAY_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "PEN"}
 FINISHED_STATUSES = {"FT", "AET", "PEN"}
 
-# Ajustes anti-flakiness
-DATE_WINDOW_DAYS = 2  # busca ±2 días (cruces UTC/local)
-MIN_MATCH_SCORE = 35  # umbral más tolerante (evita falsos negativos por alias)
-MAX_HTTP_RETRIES = 2  # reintentos por request (rápido)
+# Ajustes anti-flakiness / matching
+DATE_WINDOW_DAYS = 4   # más permisivo (±4 días)
+MIN_MATCH_SCORE = 22   # umbral más tolerante
+MAX_HTTP_RETRIES = 2
 REQUEST_TIMEOUT = 20.0
 
 # housekeeping
 QUERY_CACHE_TTL_HOURS = int(os.getenv("QUERY_CACHE_TTL_HOURS", "48").strip())
 MAX_CONSECUTIVE_FAILURES_BEFORE_MIGRATE = int(os.getenv("MAX_CONSECUTIVE_FAILURES_BEFORE_MIGRATE", "2").strip())
-MAX_CONSECUTIVE_FAILURES_BEFORE_DROP = int(os.getenv("MAX_CONSECUTIVE_FAILURES_BEFORE_DROP", "12").strip())  # ~12min si tick=1m
+MAX_CONSECUTIVE_FAILURES_BEFORE_DROP = int(os.getenv("MAX_CONSECUTIVE_FAILURES_BEFORE_DROP", "12").strip())
 
 
 # =========================
@@ -74,33 +75,52 @@ def parse_date_yyyy_mm_dd(s: str) -> Optional[date]:
     except Exception:
         return None
 
-def normalize_team(s: str) -> str:
+def _ascii_lower(s: str) -> str:
     s = (s or "").strip().lower()
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s
+
+# stopwords / ruido típico en nombres de equipos
+_STOPWORDS = {
+    "fc","cf","sc","ac","cd","ud","afc","cfc",
+    "club","de","la","el","the","and","y",
+    "sporting","sports","football","futbol","fútbol",
+    "team","clubdeportivo","clubde","clubdeportivo",
+    "sv","bv","vv","v.v.","v.v","v","fk","sk",
+    "ss","as","ks","nk","rc","real",  # "real" a veces ayuda, pero también estorba: lo quitamos para ser permissivo
+}
+
+# alias rápidos (opcionales) para casos comunes
+_ALIAS = {
+    "barca": "barcelona",
+    "fcb": "barcelona",
+    "athleti": "atletico",
+    "atleti": "atletico",
+    "psg": "paris saint germain",
+    "inter": "internazionale",
+    "man utd": "manchester united",
+    "manutd": "manchester united",
+    "man city": "manchester city",
+    "spurs": "tottenham",
+}
+
+def normalize_team(s: str) -> str:
+    s = _ascii_lower(s)
+    s = s.replace("&", " ")
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
 
-    repl = {
-        "utd": "united",
-        "athletic": "athletic",
-        "club": "",
-        "sp": "",
-        "sc": "",
-        "fc": "",
-        "cf": "",
-        "ac": "",
-        "cd": "",
-        "ud": "",
-        "afc": "",
-        "the": "",
-        "de": "",
-        "la": "",
-    }
+    # aplica alias por string completo si coincide
+    if s in _ALIAS:
+        s = _ALIAS[s]
+
     parts = []
     for p in s.split():
-        parts.append(repl.get(p, p))
-    s = " ".join([p for p in parts if p]).strip()
+        if p in _STOPWORDS:
+            continue
+        parts.append(p)
+    s = " ".join(parts).strip()
     return s
 
 def team_tokens(s: str) -> set:
@@ -115,14 +135,28 @@ def token_similarity(a: str, b: str) -> float:
     union = len(ta | tb)
     return inter / union if union else 0.0
 
+def string_similarity(a: str, b: str) -> float:
+    a2 = normalize_team(a)
+    b2 = normalize_team(b)
+    if not a2 or not b2:
+        return 0.0
+    return SequenceMatcher(None, a2, b2).ratio()
+
 def parse_teams(text: str) -> Tuple[str, str]:
     t = re.sub(r"\s+", " ", text.strip())
-    if " vs " in t.lower():
+
+    # separadores comunes
+    if re.search(r"\s+vs\s+", t, flags=re.IGNORECASE):
         a, b = re.split(r"\s+vs\s+", t, flags=re.IGNORECASE, maxsplit=1)
+    elif re.search(r"\s+v\s+", t, flags=re.IGNORECASE):
+        a, b = re.split(r"\s+v\s+", t, flags=re.IGNORECASE, maxsplit=1)
     elif " - " in t:
         a, b = t.split(" - ", 1)
+    elif " @ " in t:
+        a, b = t.split(" @ ", 1)
     else:
         raise ValueError("Formato inválido. Usa: /seguir Equipo1 vs Equipo2 [YYYY-MM-DD] | pick=...")
+
     return a.strip(), b.strip()
 
 def parse_optional_date(parts: List[str]) -> Optional[date]:
@@ -198,34 +232,64 @@ def cleanup_query_cache(state: Dict[str, Any]) -> None:
         qc.pop(k, None)
     state["query_cache"] = qc
 
+def unfollow_cmd_line(m: "TrackedMatch") -> str:
+    # comando pinchable: empieza por /
+    return f"/borrar {m.home} vs {m.away} {m.date_str}"
+
+def minute_prefix(minute: str) -> str:
+    minute = (minute or "").strip()
+    if not minute:
+        return ""
+    if minute.endswith("'"):
+        return f"⏱ {minute} "
+    # sportsdb a veces da "67" o "67:xx"
+    m2 = re.sub(r"[^\d]", "", minute)
+    if m2.isdigit():
+        return f"⏱ {m2}' "
+    return f"⏱ {minute} "
+
 
 # =========================
-# PICK parsing
+# PICK parsing (multi-pick)
 # =========================
-def normalize_pick(p: str) -> str:
+def normalize_pick_one(p: str) -> str:
     p = (p or "").strip().upper()
     p = p.replace(" ", "")
     p = p.replace("Ó", "O")
     p = p.replace("OVER", "O")
     return p
 
+def normalize_pick(p: str) -> str:
+    # admite "O1.5,O2.5" etc.
+    raw = (p or "").strip()
+    if not raw:
+        return ""
+    parts = [x.strip() for x in raw.split(",") if x.strip()]
+    norm = [normalize_pick_one(x) for x in parts]
+    # mantiene coma como separador estándar
+    return ",".join([x for x in norm if x])
+
 def parse_pick_from_tail(tail: str) -> str:
     if not tail:
         return ""
-    m = re.search(r"(?:^|[\s,])pick\s*=\s*([A-Za-z0-9\.\+\-]+)", tail, flags=re.IGNORECASE)
+    # captura también comas: pick=O1.5,O2.5
+    m = re.search(r"(?:^|[\s,])pick\s*=\s*([A-Za-z0-9\.\+\-,]+)", tail, flags=re.IGNORECASE)
     if not m:
         return ""
     return normalize_pick(m.group(1))
 
 def fmt_pick_inline(pick: str) -> str:
-    """Formato compacto para listas / líneas: ' (pick=O1.5)'."""
     pick = (pick or "").strip()
     return f" (pick={pick})" if pick else ""
 
 def fmt_pick(pick: str) -> str:
-    """Formato para alerts (multilínea)."""
     pick = (pick or "").strip()
-    return f"\nPICK: {pick}" if pick else ""
+    if not pick:
+        return ""
+    # bonito para alertas
+    if "," in pick:
+        return f"\nPICKS: {pick}"
+    return f"\nPICK: {pick}"
 
 
 # =========================
@@ -386,18 +450,23 @@ async def search_team_id_sportsdb(team_name: str) -> Optional[Tuple[str, str]]:
     teams = js.get("teams") or []
     if not teams:
         return None
+
     q = normalize_team(team_name)
     best, best_score = None, -1
     for t in teams:
         name = (t.get("strTeam") or "").strip()
         nt = normalize_team(name)
+
         sc = 0
         if nt == q:
-            sc += 120
-        sc += int(60 * token_similarity(name, team_name))
+            sc += 140
+        sc += int(70 * token_similarity(name, team_name))
+        sc += int(60 * string_similarity(name, team_name))
+
         if sc > best_score:
             best_score = sc
             best = t
+
     best = best or teams[0]
     return str(best.get("idTeam") or "").strip(), (best.get("strTeam") or team_name).strip()
 
@@ -432,6 +501,7 @@ def minute_from_sportsdb(ev: dict) -> str:
         return m
     mt = ev.get("intTime") or ev.get("strTime") or ""
     mt = str(mt).strip()
+    # si es "HH:MM" no es minuto de partido
     if re.fullmatch(r"\d{2}:\d{2}(:\d{2})?", mt):
         return ""
     return mt
@@ -443,10 +513,14 @@ def event_match_score_sportsdb(ev: dict, home_q: str, away_q: str) -> int:
 
     score = 0
     if e_set == q_set:
-        score += 120
+        score += 150
     else:
-        score += int(80 * max(token_similarity(h, home_q), token_similarity(h, away_q)))
-        score += int(80 * max(token_similarity(a, home_q), token_similarity(a, away_q)))
+        # token matching (simétrico)
+        score += int(85 * max(token_similarity(h, home_q), token_similarity(h, away_q)))
+        score += int(85 * max(token_similarity(a, home_q), token_similarity(a, away_q)))
+        # string matching (reduce problemas de naming)
+        score += int(70 * max(string_similarity(h, home_q), string_similarity(h, away_q)))
+        score += int(70 * max(string_similarity(a, home_q), string_similarity(a, away_q)))
 
     if status_bucket(status_from_sportsdb(ev)) == "INPLAY":
         score += 25
@@ -483,6 +557,7 @@ async def find_best_event_sportsdb(home: str, away: str, target_date: Optional[d
     if best_ev and best_sc >= MIN_MATCH_SCORE:
         return best_ev
 
+    # Fallback 1: ventana por equipo (home)
     try:
         home_team = await search_team_id_sportsdb(home)
         if home_team:
@@ -500,7 +575,27 @@ async def find_best_event_sportsdb(home: str, away: str, target_date: Optional[d
             if best_ev and best_sc >= MIN_MATCH_SCORE:
                 return best_ev
     except Exception as e:
-        log.info("Fallback por equipo (SportsDB) falló: %s", repr(e))
+        log.info("Fallback por equipo (SportsDB home) falló: %s", repr(e))
+
+    # Fallback 2: ventana por equipo (away) — ayuda si el home no existe por naming
+    try:
+        away_team = await search_team_id_sportsdb(away)
+        if away_team:
+            away_id, _ = away_team
+            evs = await fetch_team_events_window(away_id)
+            dd = set((td + timedelta(days=dlt)).strftime("%Y-%m-%d") for dlt in range(-DATE_WINDOW_DAYS, DATE_WINDOW_DAYS + 1))
+            evs2 = [ev for ev in evs if (ev.get("dateEvent") or "").strip() in dd] or evs
+
+            best_ev = None
+            best_sc = -1
+            for ev in evs2:
+                sc = event_match_score_sportsdb(ev, home, away)
+                if sc > best_sc:
+                    best_sc, best_ev = sc, ev
+            if best_ev and best_sc >= MIN_MATCH_SCORE:
+                return best_ev
+    except Exception as e:
+        log.info("Fallback por equipo (SportsDB away) falló: %s", repr(e))
 
     return None
 
@@ -593,7 +688,13 @@ async def apisports_team_id(state: Dict[str, Any], team_name: str) -> Optional[i
     js = await http_get_json(url, params={"search": team_name}, headers=apisports_headers())
     resp = js.get("response") or []
     if not resp:
-        return None
+        # fallback: intentar con el normalizado por si el input era raro
+        team_name2 = normalize_team(team_name)
+        if team_name2 and team_name2 != team_name:
+            js = await http_get_json(url, params={"search": team_name2}, headers=apisports_headers())
+            resp = js.get("response") or []
+        if not resp:
+            return None
 
     best_id = None
     best_sc = -1
@@ -602,9 +703,12 @@ async def apisports_team_id(state: Dict[str, Any], team_name: str) -> Optional[i
         tid = (item.get("team") or {}).get("id")
         if not name or tid is None:
             continue
-        sc = int(100 * token_similarity(name, team_name))
+
+        sc = int(110 * token_similarity(name, team_name))
+        sc += int(90 * string_similarity(name, team_name))
         if normalize_team(name) == normalize_team(team_name):
-            sc += 50
+            sc += 70
+
         if sc > best_sc:
             best_sc = sc
             best_id = int(tid)
@@ -621,16 +725,17 @@ async def apisports_team_id(state: Dict[str, Any], team_name: str) -> Optional[i
 
 def match_score_apisports(fx: dict, home_q: str, away_q: str) -> int:
     h, a = teams_from_apisports(fx)
-
     q_set = {normalize_team(home_q), normalize_team(away_q)}
     e_set = {normalize_team(h), normalize_team(a)}
 
     sc = 0
     if e_set == q_set:
-        sc += 120
+        sc += 150
     else:
-        sc += int(80 * max(token_similarity(h, home_q), token_similarity(h, away_q)))
-        sc += int(80 * max(token_similarity(a, home_q), token_similarity(a, away_q)))
+        sc += int(85 * max(token_similarity(h, home_q), token_similarity(h, away_q)))
+        sc += int(85 * max(token_similarity(a, home_q), token_similarity(a, away_q)))
+        sc += int(70 * max(string_similarity(h, home_q), string_similarity(h, away_q)))
+        sc += int(70 * max(string_similarity(a, home_q), string_similarity(a, away_q)))
 
     if status_bucket(status_from_apisports(fx)) == "INPLAY":
         sc += 25
@@ -647,6 +752,13 @@ async def find_best_event_apisports(state: Dict[str, Any], home: str, away: str,
     td = target_date or _now_utc().date()
     home_id = await apisports_team_id(state, home)
     away_id = await apisports_team_id(state, away)
+
+    # si el home no sale por naming, intenta con el normalizado
+    if home_id is None:
+        home2 = normalize_team(home)
+        if home2 and home2 != home:
+            home_id = await apisports_team_id(state, home2)
+
     if home_id is None:
         return None
 
@@ -675,6 +787,26 @@ async def find_best_event_apisports(state: Dict[str, Any], home: str, away: str,
 
     if best and best_sc >= MIN_MATCH_SCORE:
         return best
+
+    # fallback extra: si no hubo match por away_id (naming), intenta scoring sin filtrar por id
+    if away_id is None:
+        for dlt in range(-DATE_WINDOW_DAYS, DATE_WINDOW_DAYS + 1):
+            d = td + timedelta(days=dlt)
+            url = f"{APISPORTS_BASE}/fixtures"
+            js = await http_get_json(
+                url,
+                params={"date": d.strftime("%Y-%m-%d"), "team": home_id},
+                headers=apisports_headers(),
+            )
+            resp = js.get("response") or []
+            for fx in resp:
+                sc = match_score_apisports(fx, home, away)
+                if sc > best_sc:
+                    best_sc = sc
+                    best = fx
+        if best and best_sc >= MIN_MATCH_SCORE:
+            return best
+
     return None
 
 async def fetch_fixture_by_id_apisports(fixture_id: str) -> Optional[dict]:
@@ -742,7 +874,7 @@ async def migrate_match_to_apisports(state: Dict[str, Any], m: TrackedMatch) -> 
 
 
 # =========================
-# RESOLVER (DETERMINISTA)
+# RESOLVER
 # =========================
 async def resolve_match(
     state: Dict[str, Any],
@@ -752,7 +884,7 @@ async def resolve_match(
 ) -> Tuple[Optional[str], Optional[str], Optional[dict], Optional[dict]]:
     """
     Devuelve: (provider, match_id, ev_sportsdb, fx_apisports)
-    Garantía: si ya se resolvió antes con el mismo comando (query_key), reutiliza cache.
+    Reutiliza cache por query_key.
     """
     cleanup_query_cache(state)
 
@@ -815,11 +947,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Bot activo ✅\n\n"
         "Comandos:\n"
         "• /seguir <equipo1> vs <equipo2> [YYYY-MM-DD] | pick=<PICK>\n"
+        "   (multi-pick: pick=O1.5,O2.5)\n"
         "• /seguirvarios (1 por línea) | pick=<PICK_GLOBAL>\n"
-        "   Ej:\n"
-        "   /seguirvarios | pick=O1.5\n"
-        "   Villarreal vs Valencia\n"
-        "   Barcelona vs Levante | pick=O2.5\n"
         "• /lista\n"
         "• /borrar <equipo1> vs <equipo2> [YYYY-MM-DD]\n"
         "• /limpiar\n"
@@ -949,9 +1078,9 @@ async def cmd_follow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_follow_many(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /seguirvarios | pick=O1.5
+    /seguirvarios | pick=O1.5,O2.5
     Villarreal vs Valencia
-    Barcelona vs Levante 2026-02-22 | pick=O2.5
+    Barcelona vs Levante 2026-02-22 | pick=O2.5,O3.5
     """
     msg = (update.message.text or "").strip()
     if not msg:
@@ -995,9 +1124,6 @@ async def cmd_follow_many(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(header + "\n\n" + "\n".join(msgs))
 
 async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[str, str]:
-    """
-    Ejecuta la lógica de /seguir y devuelve (status, message_line).
-    """
     try:
         home, away, target_date, pick = _parse_follow_payload(raw)
     except Exception as e:
@@ -1122,7 +1248,6 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
         minute = minute_from_apisports(fx)
         bucket = status_bucket(status)
 
-    # si está FINAL y AUTO_REMOVE_FINISHED=1 => solo informa y no guarda
     if bucket == "FINISHED" and AUTO_REMOVE_FINISHED:
         save_state(state)
         msg = f"🏁 {h_ev} {hs}–{aas} {a_ev} (FINAL){fmt_pick_inline(pick)}"
@@ -1165,8 +1290,8 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
         return ("ok", msg)
 
     if bucket == "INPLAY":
-        min_txt = f" {minute}" if minute else ""
-        msg = f"✅ {title} -> 🟢 YA INICIADO{min_txt} {fmt_score(m.home, m.away, hs, aas)}"
+        min_txt = f" {minute_prefix(minute)}" if minute else " "
+        msg = f"✅ {title} -> 🟢 YA INICIADO{min_txt}{fmt_score(m.home, m.away, hs, aas)}"
         if not silent:
             await update.message.reply_text(msg)
         return ("ok", msg)
@@ -1257,17 +1382,19 @@ async def poll_once(app: Application) -> None:
             kept.append(m)
             continue
 
-        # parse
+        # parse + minute
         if m.provider == "sportsdb":
             home, away = teams_from_sportsdb(ev)
             hs, aas = score_from_sportsdb(ev)
             status = status_from_sportsdb(ev)
+            minute = minute_from_sportsdb(ev)
             bucket = status_bucket(status)
             timeline_fetch = True
         else:
             home, away = teams_from_apisports(fx)
             hs, aas = score_from_apisports(fx)
             status = status_from_apisports(fx)
+            minute = minute_from_apisports(fx)
             bucket = status_bucket(status)
             timeline_fetch = False
 
@@ -1313,7 +1440,13 @@ async def poll_once(app: Application) -> None:
                 if hs > m.last_home or aas > m.last_away:
                     if should_send(now, m.last_alert_utc):
                         scorer = home if hs > m.last_home else away
-                        await send_msg(app, f"⚽ GOL: {scorer}\n{fmt_score(home, away, hs, aas)}{fmt_pick(m.pick)}")
+                        cmd = unfollow_cmd_line(m)
+                        mp = minute_prefix(minute)
+                        await send_msg(
+                            app,
+                            f"⚽ GOL: {mp}{scorer}\n{fmt_score(home, away, hs, aas)}{fmt_pick(m.pick)}"
+                            f"\n\nDejar de seguir partido:\n{cmd}"
+                        )
                         m.last_alert_utc = now_iso()
                     changed_any = True
 
@@ -1327,11 +1460,12 @@ async def poll_once(app: Application) -> None:
                         continue
                     desc = describe_timeline(item)
                     if desc and should_send(now, m.last_alert_utc):
-                        kind, minute, team = desc
+                        kind, minute_tl, team = desc
+                        mp = minute_prefix(minute_tl)
                         if kind == "RED":
-                            msg = f"🟥 ROJA {minute}': {team}\n{home} vs {away}{fmt_pick(m.pick)}"
+                            msg = f"🟥 ROJA: {mp}{team}\n{home} vs {away}{fmt_pick(m.pick)}"
                         else:
-                            msg = f"🚫 GOL ANULADO {minute}': {team}\n{home} vs {away}{fmt_pick(m.pick)}"
+                            msg = f"🚫 GOL ANULADO: {mp}{team}\n{home} vs {away}{fmt_pick(m.pick)}"
                         await send_msg(app, msg)
                         m.last_alert_utc = now_iso()
                     m.seen_timeline_ids.append(key)
