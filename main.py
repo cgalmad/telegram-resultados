@@ -10,8 +10,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from difflib import SequenceMatcher
 
 import httpx
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+)
 
 # =========================
 # CONFIG
@@ -24,7 +29,10 @@ log = logging.getLogger("telegram-resultados")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0").strip())
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60").strip())
+
+# Base tick (job) -> 30s recomendado. El throttling por partido decide si consulta o no.
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30").strip())
+
 STATE_FILE = os.getenv("STATE_FILE", "state.json").strip()
 
 # TheSportsDB
@@ -81,6 +89,17 @@ USE_SPORTSDB_LIVE_FIRST = os.getenv("USE_SPORTSDB_LIVE_FIRST", "1").strip() not 
 # =========================
 MIN_SIDE_SCORE = int(os.getenv("MIN_SIDE_SCORE", "58").strip())
 MIN_PAIR_SCORE = int(os.getenv("MIN_PAIR_SCORE", "132").strip())
+
+# =========================
+# POLLING DINÁMICO (NUEVO)
+# =========================
+# - INPLAY: 30s
+# - SCHEDULED: 120s
+POLL_INPLAY_SECONDS = int(os.getenv("POLL_INPLAY_SECONDS", "30").strip())
+POLL_SCHEDULED_SECONDS = int(os.getenv("POLL_SCHEDULED_SECONDS", "120").strip())
+
+# Rate-limit backoff (para 429)
+RATE_LIMIT_BACKOFF_SECONDS = int(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "60").strip())
 
 # =========================
 # HELPERS
@@ -245,7 +264,7 @@ def cleanup_query_cache(state: Dict[str, Any]) -> None:
         qc.pop(k, None)
     state["query_cache"] = qc
 
-# ✅ COMANDO PINCHABLE SIN FECHA Y CON /dejardeseguir
+# ✅ COMANDO PINCHABLE SIN FECHA Y CON /dejardeseguir (se mantiene como fallback textual)
 def unfollow_cmd_line(m: "TrackedMatch") -> str:
     return f"/dejardeseguir {m.home} vs {m.away}"
 
@@ -259,6 +278,18 @@ def minute_prefix(minute: str) -> str:
     if m2.isdigit():
         return f"⏱ {m2}' "
     return f"⏱ {minute} "
+
+# ✅ NUEVO: minuto para mostrar en paréntesis (sin ⏱, solo 67')
+def minute_paren(minute: str) -> str:
+    minute = (minute or "").strip()
+    if not minute:
+        return ""
+    if minute.endswith("'"):
+        return minute
+    m2 = re.sub(r"[^\d]", "", minute)
+    if m2.isdigit():
+        return f"{m2}'"
+    return minute
 
 def split_alternates(s: str) -> List[str]:
     if not s:
@@ -387,6 +418,11 @@ class TrackedMatch:
 
     last_alert_utc: str = ""
 
+    # ✅ NUEVO: throttling por partido
+    next_poll_utc: str = ""          # ISO UTC
+    last_bucket: str = ""            # INPLAY/SCHEDULED/...
+    rate_limited_until_utc: str = "" # ISO UTC si recibimos 429
+
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_FILE):
         return {
@@ -438,6 +474,12 @@ def get_tracked(state: Dict[str, Any]) -> List[TrackedMatch]:
             it.setdefault("consecutive_failures", 0)
             it.setdefault("last_alert_utc", "")
             it.setdefault("pick", "")
+
+            # nuevos campos con defaults
+            it.setdefault("next_poll_utc", "")
+            it.setdefault("last_bucket", "")
+            it.setdefault("rate_limited_until_utc", "")
+
             out.append(TrackedMatch(**it))
         except Exception:
             log.exception("Entrada inválida en state.json, se ignora: %s", it)
@@ -487,6 +529,9 @@ def _get_client() -> httpx.AsyncClient:
         timeout = httpx.Timeout(REQUEST_TIMEOUT, connect=10.0)
         _client = httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "telegram-resultados/1.0"})
     return _client
+
+def is_http_429(exc: Exception) -> bool:
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response is not None and exc.response.status_code == 429
 
 async def http_get_json(url: str, params: Optional[dict] = None, headers: Optional[dict] = None) -> dict:
     last_exc: Optional[Exception] = None
@@ -969,16 +1014,83 @@ async def fetch_fixture_by_id_apisports(fixture_id: str) -> Optional[dict]:
 # =========================
 # TELEGRAM OUTPUT
 # =========================
-async def send_msg(app: Application, text: str) -> None:
+async def send_msg(app: Application, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
     if TARGET_CHAT_ID == 0:
         log.warning("TARGET_CHAT_ID no configurado, no envío: %s", text)
         return
-    await app.bot.send_message(chat_id=TARGET_CHAT_ID, text=text)
+    await app.bot.send_message(chat_id=TARGET_CHAT_ID, text=text, reply_markup=reply_markup)
 
 def fmt_score(home: str, away: str, hs: Optional[int], aas: Optional[int]) -> str:
     if hs is None or aas is None:
         return f"{home} vs {away}"
     return f"{home} {hs}–{aas} {away}"
+
+# =========================
+# INLINE UNFOLLOW (NUEVO)
+# =========================
+def unfollow_callback_data(m: TrackedMatch) -> str:
+    # corto y unívoco: prov|id
+    return f"unf|{m.provider}|{m.match_id}"
+
+async def cb_unfollow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
+    data = (q.data or "").strip()
+    if not data.startswith("unf|"):
+        return
+
+    parts = data.split("|", 2)
+    if len(parts) != 3:
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    _, prov, mid = parts
+    state = load_state()
+    tracked = get_tracked(state)
+    before = len(tracked)
+
+    kept = [m for m in tracked if not (m.provider == prov and str(m.match_id) == str(mid))]
+    set_tracked(state, kept)
+    save_state(state)
+
+    if len(kept) == before:
+        # ya no estaba
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        try:
+            await q.message.reply_text("Ese partido ya no estaba en la lista.")
+        except Exception:
+            pass
+        return
+
+    # intentar mostrar nombre humano
+    removed_name = None
+    for m in tracked:
+        if m.provider == prov and str(m.match_id) == str(mid):
+            removed_name = f"{m.home} vs {m.away}"
+            break
+    removed_name = removed_name or "ese partido"
+
+    try:
+        # desactiva botones del mensaje original
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    try:
+        await q.message.reply_text(f"✅ Dejado de seguir {removed_name}")
+    except Exception:
+        pass
 
 # =========================
 # MIGRATION: SportsDB -> API-SPORTS
@@ -1108,7 +1220,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "   (también funciona /borrar como alias)\n"
         "• /limpiar\n"
         "• /estado\n"
-        f"\nTick: {fmt_minutes()}\n"
+        f"\nTick base: {fmt_minutes()} (throttling por partido: INPLAY={POLL_INPLAY_SECONDS}s / SCHEDULED={POLL_SCHEDULED_SECONDS}s)\n"
         f"SportsDB: {'ON' if SPORTSDB_ENABLED else 'OFF'} | API-SPORTS: {'ON' if APISPORTS_KEY else 'OFF'}\n"
         f"Prefer API-SPORTS: {'YES' if (PREFER_APISPORTS and APISPORTS_KEY) else 'NO'}\n"
         f"SportsDB live-first: {'YES' if (SPORTSDB_ENABLED and USE_SPORTSDB_LIVE_FIRST) else 'NO'}\n"
@@ -1139,7 +1251,9 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     ti = state.get("team_index") or {}
     lines = [
         "Estado del bot:",
-        f"- Tick: {fmt_minutes()}",
+        f"- Tick base: {fmt_minutes()}",
+        f"- Throttle: INPLAY={POLL_INPLAY_SECONDS}s / SCHEDULED={POLL_SCHEDULED_SECONDS}s",
+        f"- Backoff 429: {RATE_LIMIT_BACKOFF_SECONDS}s",
         f"- SportsDB: {'ON' if SPORTSDB_ENABLED else 'OFF'}",
         f"- API-SPORTS: {'ON' if APISPORTS_KEY else 'OFF'}",
         f"- Prefer API-SPORTS: {'YES' if (PREFER_APISPORTS and APISPORTS_KEY) else 'NO'}",
@@ -1152,6 +1266,8 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"- Errores request: {st.get('http_errors', 0)}",
         f"- Migraciones: {st.get('migrations', 0)}",
         f"- Drops (no data): {st.get('drops', 0)}",
+        f"- Rate limits (429): {st.get('rate_limits', 0)}",
+        f"- Skips throttle: {st.get('skips', 0)}",
     ]
     await update.message.reply_text("\n".join(lines))
 
@@ -1164,7 +1280,6 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["Partidos seguidos:"]
     for m in tracked:
         prov = f" [{m.provider}]"
-        # ✅ SIN FECHA
         lines.append(f"• {m.home} vs {m.away}{fmt_pick_inline(m.pick)}{prov}")
     await update.message.reply_text("\n".join(lines))
 
@@ -1184,7 +1299,6 @@ def _pair_norm_sorted(home: str, away: str) -> Tuple[str, str]:
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = " ".join(context.args).strip()
 
-    # ✅ Si viene vacío: sin "Uso:" + lista de seguidos
     if not text:
         state = load_state()
         tracked = get_tracked(state)
@@ -1212,7 +1326,7 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         date_str = d.strftime("%Y-%m-%d")
     else:
         text_teams = left
-        date_str = ""  # sin fecha
+        date_str = ""
 
     try:
         home, away = parse_teams(text_teams)
@@ -1226,9 +1340,6 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     pair_set = {normalize_team(home), normalize_team(away)}
 
-    # ✅ BORRADO ROBUSTO:
-    # - con fecha: borra solo ese día
-    # - sin fecha: borra cualquier seguido de esa pareja (cualquier fecha)
     if d:
         tracked = [
             m for m in tracked
@@ -1240,7 +1351,6 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             if not ({normalize_team(m.home), normalize_team(m.away)} == pair_set)
         ]
 
-    # ✅ Limpieza de query_cache coherente con el borrado
     qc = state.get("query_cache", {}) or {}
 
     x, y = _pair_norm_sorted(home, away)
@@ -1248,7 +1358,6 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         qkey = f"{x}__{y}__{d.strftime('%Y-%m-%d')}"
         qc.pop(qkey, None)
     else:
-        # borra todas las entradas para esa pareja (cualquier fecha)
         prefix = f"{x}__{y}__"
         to_del = [k for k in qc.keys() if k.startswith(prefix)]
         for k in to_del:
@@ -1343,11 +1452,7 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
 
     if SPORTSDB_ENABLED:
         try:
-            before_n = len(state.get("team_index") or {})
             await ensure_team_index_sportsdb(state)
-            after_n = len(state.get("team_index") or {})
-            if after_n != before_n:
-                save_state(state)
         except Exception as e:
             log.info("ensure_team_index_sportsdb falló (se continúa): %s", repr(e))
 
@@ -1364,6 +1469,11 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
         if not already.query_key:
             already.query_key = qkey
             changed = True
+
+        # set throttle defaults si no los tiene
+        if not already.next_poll_utc:
+            already.next_poll_utc = now_iso()
+
         if changed:
             set_tracked(state, tracked)
             save_state(state)
@@ -1490,6 +1600,9 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
         created_utc=now_iso(),
         consecutive_failures=0,
         last_alert_utc="",
+        next_poll_utc=now_iso(),
+        last_bucket=bucket,
+        rate_limited_until_utc="",
     )
 
     tracked.append(m)
@@ -1518,6 +1631,41 @@ async def _follow_one(update: Update, raw: str, silent: bool = False) -> Tuple[s
     return ("ok", msg)
 
 # =========================
+# POLLING DINÁMICO HELPERS
+# =========================
+def _dt_or_none(iso: str) -> Optional[datetime]:
+    return parse_iso_dt(iso or "")
+
+def _should_poll_match(m: TrackedMatch, now: datetime) -> bool:
+    # backoff por rate limit
+    rl = _dt_or_none(m.rate_limited_until_utc)
+    if rl and now < rl:
+        return False
+
+    np = _dt_or_none(m.next_poll_utc)
+    if not np:
+        return True
+    return now >= np
+
+def _schedule_next_poll(m: TrackedMatch, bucket: str) -> None:
+    now = _now_utc()
+    if bucket == "INPLAY":
+        delta = timedelta(seconds=POLL_INPLAY_SECONDS)
+    elif bucket == "SCHEDULED":
+        delta = timedelta(seconds=POLL_SCHEDULED_SECONDS)
+    else:
+        # OTHER: intermedio
+        delta = timedelta(seconds=max(POLL_SCHEDULED_SECONDS, 90))
+    m.next_poll_utc = (now + delta).isoformat()
+    m.last_bucket = bucket
+
+def _apply_rate_limit_backoff(m: TrackedMatch) -> None:
+    now = _now_utc()
+    m.rate_limited_until_utc = (now + timedelta(seconds=RATE_LIMIT_BACKOFF_SECONDS)).isoformat()
+    # empuja también el next_poll para no reintentar en el mismo tick
+    m.next_poll_utc = m.rate_limited_until_utc
+
+# =========================
 # POLLING JOB
 # =========================
 async def poll_once(app: Application) -> None:
@@ -1531,9 +1679,16 @@ async def poll_once(app: Application) -> None:
     kept: List[TrackedMatch] = []
 
     for m in tracked:
+        now = _now_utc()
+
+        # ✅ throttling por partido
+        if not _should_poll_match(m, now):
+            stats_inc(state, "skips", 1)
+            kept.append(m)
+            continue
+
         ev = None
         fx = None
-        now = _now_utc()
 
         try:
             if m.provider == "sportsdb":
@@ -1588,7 +1743,15 @@ async def poll_once(app: Application) -> None:
                     if m.consecutive_failures != 0:
                         m.consecutive_failures = 0
                         changed_any = True
-        except Exception:
+        except Exception as e:
+            if is_http_429(e):
+                # ✅ 429: no sumar como fallo "malo", aplicar backoff y seguir
+                stats_inc(state, "rate_limits", 1)
+                _apply_rate_limit_backoff(m)
+                changed_any = True
+                kept.append(m)
+                continue
+
             log.exception("Error consultando match provider=%s id=%s", m.provider, m.match_id)
             m.consecutive_failures += 1
             stats_inc(state, "http_errors", 1)
@@ -1610,6 +1773,10 @@ async def poll_once(app: Application) -> None:
             minute = minute_from_apisports(fx)
             bucket = status_bucket(status)
             timeline_fetch = False
+
+        # ✅ programa el próximo poll en base al estado ACTUAL
+        _schedule_next_poll(m, bucket)
+        changed_any = True
 
         if bucket == "INPLAY" and not m.started_notified:
             if should_send(now, m.last_alert_utc):
@@ -1633,6 +1800,7 @@ async def poll_once(app: Application) -> None:
             m.started_notified = True
             changed_any = True
 
+        # VAR correction
         if (
             m.last_home is not None and m.last_away is not None
             and hs is not None and aas is not None
@@ -1645,16 +1813,29 @@ async def poll_once(app: Application) -> None:
                 m.last_alert_utc = now_iso()
             changed_any = True
         else:
+            # ✅ GOAL detection
             if m.last_home is not None and m.last_away is not None and hs is not None and aas is not None:
                 if hs > m.last_home or aas > m.last_away:
                     if should_send(now, m.last_alert_utc):
                         scorer = home if hs > m.last_home else away
-                        cmd = unfollow_cmd_line(m)
-                        mp = minute_prefix(minute)
+
+                        # ✅ Mejora 1: minuto entre paréntesis en la primera línea
+                        mp = minute_paren(minute)
+                        mp_txt = f" ({mp})" if mp else ""
+
+                        # ✅ Mejora 2: botón 1-click “Dejar de seguir”
+                        kb = InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("🛑 Dejar de seguir", callback_data=unfollow_callback_data(m))]]
+                        )
+
+                        # (fallback textual opcional por si quieres verlo)
+                        # cmd = unfollow_cmd_line(m)
+
                         await send_msg(
                             app,
-                            f"⚽ GOL: {mp}{scorer}\n{fmt_score(home, away, hs, aas)}{fmt_pick(m.pick)}"
-                            f"\n\nDejar de seguir partido:\n{cmd}"
+                            f"⚽ GOL: {scorer}{mp_txt}\n{fmt_score(home, away, hs, aas)}{fmt_pick(m.pick)}\n\n"
+                            f"Pulsa para dejar de seguir:",
+                            reply_markup=kb,
                         )
                         m.last_alert_utc = now_iso()
                     changed_any = True
@@ -1669,11 +1850,11 @@ async def poll_once(app: Application) -> None:
                     desc = describe_timeline(item)
                     if desc and should_send(now, m.last_alert_utc):
                         kind, minute_tl, team = desc
-                        mp = minute_prefix(minute_tl)
+                        mp2 = minute_prefix(minute_tl)
                         if kind == "RED":
-                            msg = f"🟥 ROJA: {mp}{team}\n{home} vs {away}{fmt_pick(m.pick)}"
+                            msg = f"🟥 ROJA: {mp2}{team}\n{home} vs {away}{fmt_pick(m.pick)}"
                         else:
-                            msg = f"🚫 GOL ANULADO: {mp}{team}\n{home} vs {away}{fmt_pick(m.pick)}"
+                            msg = f"🚫 GOL ANULADO: {mp2}{team}\n{home} vs {away}{fmt_pick(m.pick)}"
                         await send_msg(app, msg)
                         m.last_alert_utc = now_iso()
                     m.seen_timeline_ids.append(key)
@@ -1725,6 +1906,10 @@ def build_app() -> Application:
 
     app.add_handler(CommandHandler("limpiar", cmd_clear))
 
+    # ✅ BOTÓN inline para dejar de seguir
+    app.add_handler(CallbackQueryHandler(cb_unfollow, pattern=r"^unf\|"))
+
+    # ✅ Tick base 30s (o lo que pongas en POLL_SECONDS). El throttling real es por partido.
     app.job_queue.run_repeating(job_poll, interval=POLL_SECONDS, first=5)
     return app
 
@@ -1732,7 +1917,7 @@ def main() -> None:
     app = build_app()
     log.info("Bot started. Target chat id: %s", TARGET_CHAT_ID)
     log.info(
-        "SPORTSDB=%s | APISPORTS=%s | PREFER_APISPORTS=%s | LIVE_FIRST=%s | AUTO_REMOVE_FINISHED=%s | HARD_GATE(min_side=%s min_pair=%s)",
+        "SPORTSDB=%s | APISPORTS=%s | PREFER_APISPORTS=%s | LIVE_FIRST=%s | AUTO_REMOVE_FINISHED=%s | HARD_GATE(min_side=%s min_pair=%s) | THROTTLE(inplay=%ss scheduled=%ss) | BASE_TICK=%ss",
         "ON" if SPORTSDB_ENABLED else "OFF",
         "ON" if APISPORTS_KEY else "OFF",
         "YES" if (PREFER_APISPORTS and APISPORTS_KEY) else "NO",
@@ -1740,6 +1925,9 @@ def main() -> None:
         "YES" if AUTO_REMOVE_FINISHED else "NO",
         MIN_SIDE_SCORE,
         MIN_PAIR_SCORE,
+        POLL_INPLAY_SECONDS,
+        POLL_SCHEDULED_SECONDS,
+        POLL_SECONDS,
     )
     app.run_polling(drop_pending_updates=True)
 
